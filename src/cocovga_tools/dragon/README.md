@@ -6,8 +6,10 @@ Dragon 32 or a Dragon 64 (in 32K mode) with DragonDOS.
 
     RUN"W64TEST"
 
-The program loads `W64LIB.BIN` (machine code at $7C00-$7FFF, protected with
-`CLEAR 500,&H7BFF`). It sends CoCoVGA register pages the same way CoCoVGA's
+The program loads `W64LIB.BIN` (machine code at $7800-$7BFF, protected with
+`CLEAR 500,&H77FF`; below $7C00 so a DOS or extension that keeps the top of
+RAM, such as DOSPLUS with the DW4 / SDC extender at $7EFF-$7FFF, leaves it
+room). It sends CoCoVGA register pages the same way CoCoVGA's
 own SG4PG2 / WIDTH64 do (the $FF22 combination lock, then the 512 byte page
 shown for one frame), and draws the 64x32 screen in a 2 KB CG2 buffer at
 $0C00.

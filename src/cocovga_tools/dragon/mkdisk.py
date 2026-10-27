@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Build W64TEST.VDK: a 40 track single sided DragonDOS disk with
-W64TEST.BAS (tokenised Dragon BASIC) and W64LIB.BIN ($7C00-$7FFF).
+W64TEST.BAS (tokenised Dragon BASIC) and W64LIB.BIN ($7800-$7BFF).
 
   mkdisk.py w64test.bas w64lib.raw W64TEST.VDK
 """
@@ -38,7 +38,7 @@ def main():
     back = detok(prog)
     libraw = open(lib, 'rb').read()
     files = [('W64TEST', 'BAS', dosfile(0x01, 0x2401, prog, 0x8B8D)),
-             ('W64LIB', 'BIN', dosfile(0x02, 0x7C00, libraw, 0x7C1E))]
+             ('W64LIB', 'BIN', dosfile(0x02, 0x7800, libraw, 0x781E))]
     img = bytearray(b'\xE5' * (NSEC * 256))
     used = set(range(lsn_of(16, 1), lsn_of(16, 1) + SPT)) | set(range(lsn_of(20, 1), lsn_of(20, 1) + SPT))
     nxt = lsn_of(21, 1)

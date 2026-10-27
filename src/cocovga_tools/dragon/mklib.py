@@ -3,27 +3,30 @@
 mklib.py - W64LIB.BIN: machine code helpers for the CoCoVGA / RGBtoHDMI
 64 column test (Dragon 32/64, DragonDOS), called from BASIC with USR.
 
-Loaded at $7C00 (protect with CLEAR 500,&H7BFF). Entry points (EXEC; the argument is POKEd to ARG = $7FFE first):
-  $7C00 REGSET  page          send a CoCoVGA register page: the 512 byte page
+Loaded at $7800-$7BFF (protect with CLEAR 500,&H77FF): below $7800 so that a
+DOS or extension that keeps the top of RAM (e.g. DOSPLUS / DW4 reserve
+$7EFF-$7FFF) still leaves it room. Entry points (EXEC; the argument is POKEd
+to ARG = $7BFE first):
+  $7800 REGSET  page          send a CoCoVGA register page: the 512 byte page
                               (arg = address / 512) is cleared, the 9 bytes
                               at PARAM copied in, and shown for one frame
                               after CoCoVGA's combination lock on $FF22 (as
                               CoCoVGA's SG4PG2); the display is then restored
-  $7C03 W64ON   page(+128)    display a 2 KB buffer as CG2 (64 columns with
+  $7803 W64ON   page(+128)    display a 2 KB buffer as CG2 (64 columns with
                               CoCoVGA); +128 = colour set 1 (buff / orange)
-  $7C06 TEXTON  0 / 128       BASIC's text screen ($0400), 128 = orange set
-  $7C09 PM4ON   page(+128)    display a 6 KB PMODE 4 page
-  $7C0C SCROLL  page          scroll the 64x32 buffer up one line
-  $7C0F STRESS  page          scroll + new line every frame (as fast as the
+  $7806 TEXTON  0 / 128       BASIC's text screen ($0400), 128 = orange set
+  $7809 PM4ON   page(+128)    display a 6 KB PMODE 4 page
+  $780C SCROLL  page          scroll the 64x32 buffer up one line
+  $780F STRESS  page          scroll + new line every frame (as fast as the
                               CPU can) until a key or FRAMES frames
-  $7C12 FULLST  page          rewrite all 2048 characters every update
+  $7812 FULLST  page          rewrite all 2048 characters every update
                               until a key or FRAMES frames
-  $7C15 FILL64  page          fill the 2 KB buffer with PARAM+9
-  $7C18 CHARSET page          fill the 2 KB buffer with codes 0-255
-  $7C1B PUTSTR  VARPTR(S$)    copy S$ to the address in DEST, ASCII -> 6847
+  $7815 FILL64  page          fill the 2 KB buffer with PARAM+9
+  $7818 CHARSET page          fill the 2 KB buffer with codes 0-255
+  $781B PUTSTR  VARPTR(S$)    copy S$ to the address in DEST, ASCII -> 6847
                               codes (lower case -> $00-$1F); DEST advances
-  $7C1E         RTS (the file's exec address), then "W64L" + version byte
-PARAM ($7FF0): 9 register page bytes, +9 fill value, +10/11 FRAMES (0 = no
+  $781E         RTS (the file's exec address), then "W64L" + version byte
+PARAM ($7BF0): 9 register page bytes, +9 fill value, +10/11 FRAMES (0 = no
 limit), +12/13 DEST. Interrupts are masked inside REGSET / STRESS / FULLST.
 """
 import sys
@@ -79,15 +82,16 @@ def covdg(ch):
     if a >= 0x40: return a
     return a ^ 0x40
 
-ORG = 0x7C00
-PARAM = 0x7FF0
+ORG = 0x7800
+TOP = 0x7C00             # first byte after the library
+PARAM = TOP - 0x10
 FILLV = PARAM + 9
 FRAMES = PARAM + 10
 ARG = PARAM + 14         # call argument (byte, or 16 bit for PUTSTR)
-EXEC = 0x7C1E
-LIBVER = 3
+EXEC = ORG + 0x1E
+LIBVER = 4               # 4: moved from $7C00 to $7800
 DEST = PARAM + 12
-V = 0x7FE0              # variables
+V = TOP - 0x20           # variables
 CURPAGE, CURV, CURVDG, TMPPAGE = V, V + 1, V + 2, V + 3
 TMPEND, TMPEND2, COUNT, FCNT = V + 4, V + 6, V + 8, V + 10
 FSTIMEOUT = V + 12      # times field sync did not come (PIA0 CB1 flag)
@@ -97,8 +101,8 @@ INTCNV = 0x8B2D         # Dragon BASIC: USR argument -> D
 a = A(ORG)
 for name in ('regset', 'w64on', 'texton', 'pm4on', 'scroll', 'stress', 'fullst', 'fill64', 'charset', 'putstr'):
     a.jmp(name)
-# $7C1E: the file's exec address (a DOS that runs a binary after LOAD just
-# returns), then "W64L" + version at $7C1F for the BASIC program to check
+# ORG+$1E: the file's exec address (a DOS that runs a binary after LOAD just
+# returns), then "W64L" + version at ORG+$1F for the BASIC program to check
 assert a.pc == EXEC, hex(a.pc)
 a.rts()
 a.data(list(b'W64L') + [LIBVER])
@@ -311,8 +315,8 @@ assert end <= V, hex(end)
 # variables: CURPAGE=2 (text), CURV=0, CURVDG=0, rest 0; PARAM: 9 zero bytes,
 # fill $60, FRAMES 0
 img = bytearray(code) + bytearray(V - end)
-img += bytes([2, 0, 0, 0]) + bytes(12)                  # $7FE0-$7FEF
-img += bytes(9) + bytes([0x60]) + bytes([0, 0]) + bytes(4)   # $7FF0-$7FFF
-assert ORG + len(img) == 0x8000
+img += bytes([2, 0, 0, 0]) + bytes(12)                  # V .. V+15
+img += bytes(9) + bytes([0x60]) + bytes([0, 0]) + bytes(4)   # PARAM .. PARAM+15
+assert ORG + len(img) == TOP
 open(sys.argv[1] if len(sys.argv) > 1 else 'w64lib.raw', 'wb').write(img)
-print('W64LIB: %d bytes of code, $%04X-$7FFF' % (len(code), ORG))
+print('W64LIB: %d bytes of code, $%04X-$%04X' % (len(code), ORG, TOP - 1))
