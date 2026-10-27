@@ -2943,6 +2943,16 @@ void cocovga_info_live(int line) {
     osd_set(line++, 0, m);
     sprintf(m, "Max hook time just before: %u us", v->reinit_hook_max);
     osd_set(line++, 0, m);
+    // the 6847 picture is found by the black border round it: with no border
+    // in the capture (some output resolutions with integer scaling and a
+    // profile minimum of exactly 256x192) nothing can be recognised
+    {
+        int dw = (capinfo->sizex2 & SIZEX2_DOUBLE_WIDTH) ? 2 : 1;
+        int dh = (capinfo->sizex2 & SIZEX2_DOUBLE_HEIGHT) ? 2 : 1;
+        int border = capinfo->width >= (CV_ACTIVE_W + 4) * dw && capinfo->height >= (CV_ACTIVE_H + 4) * dh;
+        sprintf(m, "Capture %dx%d: %s", capinfo->width, capinfo->height, border ? "border OK" : "NO BORDER, see doc");
+        osd_set(line++, 0, m);
+    }
     line++;
     cv_budget_line(line);
 }

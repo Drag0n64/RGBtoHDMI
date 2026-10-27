@@ -97,6 +97,17 @@ with the 4-bit LumaCode palette control, 8bpp frame buffer and a double
 width + height frame buffer (the profile default); it pauses while the
 RGBtoHDMI menu is open.
 
+The 6847 picture is found by the black border round it, so the capture must
+include some border. With integer scaling RGBtoHDMI fits the capture to the
+output resolution, starting from the profile's minimum size; with a minimum
+of exactly 256x192, outputs such as 1024x768, 1280x960, 1280x1024 and
+1366x768 captured exactly the 256x192 picture with no border, and nothing was
+recognised. The MC6847 profiles therefore ask for at least 264x196 (4 dots /
+2 lines of border each side). That changes nothing at 800x600, 1280x720,
+1920x1080 and the other common resolutions; at the four above the picture is
+scaled one step smaller, with a border. The Live Timing page shows the
+capture size and whether it has a border.
+
 ## Building
 
 ```
