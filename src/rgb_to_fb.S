@@ -116,6 +116,18 @@ rgb_to_fb:
 rgb_to_fb_sub:
         push   {r4-r12, lr}
 
+        // Touch mc6847_artifact_enable's cache line as early as possible:
+        // it's read again much later, once per frame, to resolve the C64
+        // LumaCode double 8bpp slot (see "once per frame" below). A cold
+        // cache line there right after a re-init (sync/timing changed -
+        // see cv_live.reinit_timing/reinit_state) could still delay that
+        // later read; touching it here, with the whole parameter-copying
+        // block below between this and the actual use, gives the cache
+        // fill all that time to complete well clear of any PSYNC-sensitive
+        // code, instead of racing it.
+        ldr    r9, =mc6847_artifact_enable
+        ldr    r9, [r9]
+
         // Save the capture_info_t parameters to absolute addresses
         ldr    r2, [r0, #O_FB_PITCH]
         str    r2, param_fb_pitch
@@ -333,6 +345,19 @@ skip_double_check:
 
         ldr    r9, param_capture_line
         ldr    r8, [r9, r7, lsl #2]
+
+        // once per frame: the C64 LumaCode double 8bpp slot always names the
+        // MC6847-artifact-capable routine; resolve it to the plain one here
+        // when artifacts are off, so that routine never has to check
+        // mc6847_artifact_enable itself on every scanline
+        ldr    r9, =capture_line_c64lc6847_double_8bpp
+        cmp    r8, r9
+        bne    skip_6847_resolve
+        ldr    r9, =mc6847_artifact_enable
+        ldr    r9, [r9]
+        cmp    r9, #0
+        ldreq  r8, =capture_line_c64lc_sixbits_double_8bpp
+skip_6847_resolve:
 
         ldr    r9, param_video_type
         cmp    r9, #VIDEO_TELETEXT
@@ -2672,7 +2697,7 @@ capture_line_normal_6bpp_table:
         .word capture_line_default_sixbits_double_16bpp
         .word capture_line_atari_sixbits_double_8bpp
         .word capture_line_c64lc_sixbits_double_16bpp
-        .word capture_line_c64lc_sixbits_double_8bpp
+        .word capture_line_c64lc6847_double_8bpp       // = c64lc_sixbits_double_8bpp unless MC6847 artifacts on
         .word capture_line_atarilc_sixbits_double_16bpp
         .word capture_line_atarilc_sixbits_double_8bpp
         .word capture_line_default_sixbits_double_16bpp
@@ -2723,7 +2748,7 @@ capture_line_normal_odd_even_6bpp_table:
         .word capture_line_default_sixbits_double_16bpp
         .word capture_line_atari_sixbits_double_8bpp
         .word capture_line_c64lc_sixbits_double_16bpp
-        .word capture_line_c64lc_sixbits_double_8bpp
+        .word capture_line_c64lc6847_double_8bpp       // = c64lc_sixbits_double_8bpp unless MC6847 artifacts on
         .word capture_line_default_sixbits_double_16bpp
         .word capture_line_atarilc_sixbits_double_8bpp
         .word capture_line_default_sixbits_double_16bpp
@@ -3825,9 +3850,9 @@ dummyscreen:               // used by capture preload
 // ---------------------------------------------------------------------
 // Buffer selection helpers, kept out of line so the capture loop above
 // doesn't grow (its pc relative loads are at the limit of their range).
-// The CoCoVGA 64 column text emulation (cocovga_frame_hook in
-// rgb_to_hdmi.c) sets cocovga_redirect = capture buffer + 1 while it keeps
-// its own picture on screen.
+// The CoCoVGA emulation (cocovga_frame_hook in rgb_to_hdmi.c) sets
+// cocovga_redirect = capture buffer + 1 to choose the next capture buffer
+// and cocovga_noflip = 1 while it keeps its own picture on screen.
 // ---------------------------------------------------------------------
         .align 2
 #ifdef MULTI_BUFFER
@@ -3855,7 +3880,7 @@ flip_inhibited:
         tst    r3, #(BIT_INTERLACED_VIDEO | BIT_PROBE)
         movne  pc, lr
         push   {r0}
-        ldr    r0, =cocovga_redirect
+        ldr    r0, =cocovga_noflip
         ldr    r0, [r0]
         cmp    r0, #0
         pop    {r0}

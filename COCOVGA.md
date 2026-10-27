@@ -57,6 +57,8 @@ screen may lag the 6847 by a few frames and catch up when it stops.
 | Extras: inverse-video text | yes |
 | Reset / edit-mask handling of register page 0 | yes |
 | Leaving W64 (any non-CG2 picture), returning to 32 columns | yes |
+| 32-column lower case (font register "force lower case", or the menu) | yes |
+| MC6847 NTSC artifact colours in PMODE 4 | yes |
 | Custom palettes, VG6 16-colour mode, uploaded character sets | not yet |
 
 Not possible without help from the digitizer firmware: CoCoVGA notices the
@@ -72,6 +74,10 @@ therefore recognises register pages by their content instead.
   "Character ROM Pattern", and checked against an independent
   reconstruction (DamienG's FontStruct): 90 of 93 glyphs identical, the
   remaining 3 re-checked against the data sheet scan.
+* Dragon 200-E lower case (32 columns only): the 200-E's lower case
+  character ROM, as dumped in
+  [go4retro/dragon200e-lowercase](https://github.com/go4retro/dragon200e-lowercase)
+  (`charsets/fixrom/rom26.ic1.0.bin`, codes $00-$1F).
 
 ## Installing
 
@@ -138,13 +144,16 @@ Two pages in the **Info** menu do that:
   buffers, the screen is not touched) and shows min / avg / max time per
   frame in microseconds: 32 column text, register page, entering W64 (full
   redraw, aligned and unaligned), W64 idle / typing / scrolling, graphics,
-  black screen. A "!" means a row did not take the path it measures.
+  black screen, with lower case off and on. A "!" means a row did not take the path it measures.
 * **CoCoVGA Live Timing** - with the Dragon running. Since the page was
   last opened: frames, dropped frames, frame rate, hook time per frame type
   (avg / max); since boot: re-inits caused by timing or sync changes and the
   longest hook time just before them. Both pages show the time budget,
   estimated from the measured sync: lines between the end of the capture
   and the next vsync.
+
+To isolate lower case, compare the "Lower case on" rows / the "Lower 32"
+line with the rest, or set **32 Col Lower Case** to Off.
 
 ## Verified with XRoar
 
@@ -155,6 +164,10 @@ on screen, decoded independently with XRoar's character ROMs:
 * a test ROM driving the 6847 like the CoVGA driver (register page, CG2
   64x32 with typing and scrolling, back to 32 columns) on XRoar's NTSC
   Dragon, with the capture shifted by 0, 1 and 2 dots;
+* 32 column lower case (green and orange colour sets) against
+  XRoar's 6847T1 lower case glyphs, lower case off again, and PMODE 4 in
+  both colour sets with artifacts off, Red/Blue and Blue/Red; the artifact
+  colours match XRoar's NTSC rendering;
 * NitrOS-9 Level 1 with the CoVGA driver booting to its prompt on XRoar's
   NTSC CoCo (1390 64-column frames). The real driver shows its register
   page for one frame with a mode change part way down the screen (green
@@ -196,3 +209,85 @@ run and why.
   translation)
 * Motorola MC6847T1 data sheet
 * c0pperdragon, LumaCode wiki: MC6847digitizer colour encoding
+
+## 32-column lower case and NTSC artifacts
+
+### 32-column lower case
+
+Setting: **Palette Menu → 32 Col Lower Case** (`cocovga_lower_case=`):
+
+| Value | Lower case | Glyphs |
+|---|---|---|
+| Auto (default) | when a CoCoVGA register page sets the font register's "force lower case" bit (NitrOS-9's CoVGA driver does; from BASIC use CCVCNF32.BAS) | CoCoVGA's lower case |
+| Off | never: inverse stays inverse, as on a plain 6847 | - |
+| CoCoVGA | always, no register page needed (e.g. BASIC typing after SHIFT-0) | CoCoVGA's lower case |
+| Dragon 200-E | always, no register page needed | the Dragon 200-E's lower case ROM |
+
+Both fonts sit on the baseline of the 6847's capitals. The MC6847T1's own
+lower case is not offered here: it is drawn for the T1's capitals, which sit
+two rows higher, so next to the 6847's capitals it looks misaligned (W64
+still uses it with T1 capitals when the font register's T1 bit is set).
+
+It needs **CoCoVGA 64 Col** on. With lower case on, inverse
+characters $00-$1F on the normal 32x16 text screen are shown as lower case,
+dark on green like normal text (also in programs that use inverse letters
+on purpose, as on a 6847T1). $20-$3F stay inverse, as on a
+real 6847T1. Only the inverse cells are looked at (one pixel per cell finds
+them), so the cost per frame stays small. While it is active, frames are
+captured into a buffer that is not on screen, fixed up, then flipped.
+
+The fix-up has to be done on every captured frame (each capture overwrites
+the last one). It runs under the same work limit as the 64 column screen:
+a captured screen is fixed up off screen, over several frames if needed
+(newer captures are skipped meanwhile), and shown when complete. With a
+few lower case letters on screen that takes one frame; with a screen full
+of them (about 2-3 ms of work on a Pi Zero W) the 32 column screen updates
+a few times a second. Each cell is kept cheap: each inverse cell is identified from 11 dots
+(they tell all 64 inverse 6847 glyphs apart) and checked against 28 dots,
+instead of reading all 96. Over those 28 dots any two glyphs differ in at
+least 3 dots, as over all 96, so 1 or 2 wrong dots can never show a wrong
+letter (the cell stays inverse for that frame, as before). The glyphs are
+the 6847's own (`mc6847_rom_font`); in the orange colour set the 6847 draws
+text in light orange (LumaCode code 3). The lower case glyph is written
+with 32 bit stores. A full screen of lower case is about 14,500 frame
+buffer reads and 49,000 word writes per frame (was about
+62,000 reads and 197,000 byte writes). Pictures
+not on a 4 pixel boundary, or not double width and height, use the general
+(slower) path.
+
+### NTSC artifact colours (PMODE 4)
+
+Setting: **Palette Menu → 6847 Artifacts** = Off / Red/Blue / Blue/Red
+(`mc6847_artifact=`; on in the 60 Hz MC6847 profile, off elsewhere).
+
+The MC6847 LumaCode capture routine is replaced by
+`capture_line_c64lc6847_double_8bpp` (`src/capture_line_mc6847_8bpp.S`),
+which runs the original routine when artifacts are off. When on, every dot
+pair goes through a 256-entry table as it is captured: a black dot next to
+a buff dot is shown orange-red or blue, depending on which of the two is lit;
+in the green colour set (where PMODE 4's "black" is dark green) dark or mid
+green. The colours are taken from XRoar's simulated NTSC composite video.
+Only PMODE 4 mixes two colours inside one dot pair. No extra frames of
+delay: the colour is decided while the line is captured.
+
+An artifact dot keeps its own colour code in the low 4 bits and only gets
+a tag in bits 4-6, which the palette turns into the artifact colour. The
+CoCoVGA decoders only look at the low 4 bits, so 64 column text and lower
+case work with artifacts on however the capture lines up with the 6847's
+dot pairs (checked with the capture shifted by 0, 1 and 2 dots). Which table
+is used (green set graphics or not) is decided per frame from the border of
+the frame just captured: the middle of the capture's first and last lines
+must both be green, so text below green graphics (split screen) stays plain.
+The table applies from the next frame, so the first text frame after green
+graphics can show green artifact fringes for one frame.
+
+Don't turn on RGBtoHDMI's own **NTSC Colour** setting together with **6847
+Artifacts**: it also uses the upper bits of each pixel (as the neighbouring
+pixel's colour) and the two would fight. It is off in the MC6847 profile.
+
+Checked on a real Dragon with a Pi Zero W. Notes:
+
+* Red and blue depend on which dot of each pair is first, i.e. on the
+  capture alignment: if they come out swapped, use the other setting.
+* The vsync marker / debug colours are not drawn while artifacts are on.
+* Capture loop cost: 3 extra instructions per dot pair.

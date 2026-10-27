@@ -24,6 +24,8 @@ static uint8_t cg_lut[16];
 #define CV_MIN_CHARS 32
 // CG2 pixel rows always decoded per frame (a full pass takes <= 8 frames)
 #define CV_MIN_DECODE_ROWS 8
+// 32 column cells always looked at per frame by the lower case fix-up
+#define CV_MIN_LC_CELLS 32
 // maximum Hamming distance accepted when recognising a text glyph
 #define CV_GLYPH_TOLERANCE 4
 
@@ -72,6 +74,9 @@ void cv_init(cv_state_t *s) {
    s->display_buf = -1;
    s->build_buf = -1;
    s->full_pos = -1;
+   s->lc_buf = -1;
+   s->lc_font = CV_LC_COCOVGA;
+   s->lc_on_mode = -1;
    cv_leave_count = 0;
 }
 
@@ -383,7 +388,7 @@ static int renderable(const cv_state_t *s) {
 // The T1 table puts lower case on the baseline of its own capitals (row 7);
 // the 6847's capitals sit 2 rows lower (rows 3-9). Rows 10-11 of every T1
 // lower case glyph are empty, so moving them down loses nothing.
-const uint8_t *cv_lower_glyph(int code, int t1_capitals) {
+const uint8_t *cv_lower_glyph(int code, int style) {
    static uint8_t low[32][12];
    static int ready = 0;
    if (!ready) {
@@ -392,7 +397,9 @@ const uint8_t *cv_lower_glyph(int code, int t1_capitals) {
       }
       ready = 1;
    }
-   return t1_capitals ? mc6847t1_font[64 + (code & 31)] : low[code & 31];
+   if (style == CV_LC_T1) return mc6847t1_font[64 + (code & 31)];
+   if (style == CV_LC_DRAGON200E) return dragon200e_lower_font[code & 31];
+   return low[code & 31];
 }
 
 static void draw_char(const cv_state_t *s, uint8_t *fb, int pitch, int index, int value) {
@@ -421,7 +428,7 @@ static void draw_char(const cv_state_t *s, uint8_t *fb, int pitch, int index, in
          glyph = t1 ? mc6847t1_font[code] : mc6847_font[code];
          inverse = 0;
       } else if (lower && code < 32) {
-         glyph = cv_lower_glyph(code, t1);    // lower case replaces inverse
+         glyph = cv_lower_glyph(code, t1 ? CV_LC_T1 : CV_LC_COCOVGA);    // lower case replaces inverse
          inverse = 0;
       } else {
          glyph = t1 ? mc6847t1_font[code] : mc6847_font[code];
@@ -551,6 +558,7 @@ int cv_stop(cv_state_t *s) {
    s->build_buf = -1;
    s->full_pos = -1;
    s->rows_valid = 0;
+   s->lc_buf = -1;
    cv_leave_count = 0;
    return was_on;
 }
@@ -560,6 +568,10 @@ void cv_invalidate(cv_state_t *s) {
    // border are gone, so start again from the next captured CG2 frame
    cv_stop(s);
 }
+
+// 32 column lower case (below)
+static int lowercase_32_fast(cv_state_t *s, uint8_t *fb, int pitch, int *pos, int limited, int *count);
+static int lowercase_fast_ok(const cv_state_t *s, const uint8_t *fb, int pitch);
 
 // a buffer for the next capture that is neither on screen nor the W64 one
 static int spare_buffer(int keep, int displayed, int nbuffers) {
@@ -571,8 +583,9 @@ static int spare_buffer(int keep, int displayed, int nbuffers) {
 
 cv_frame_t cv_frame(cv_state_t *s, int captured, int displayed, int nbuffers,
                     cv_buffer_fn buffer, int pitch, int width, int height,
-                    int *redirect, int *swap_to) {
-   *redirect = 0;
+                    int *capture_next, int *inhibit_flip, int *swap_to) {
+   *capture_next = -1;
+   *inhibit_flip = 0;
    *swap_to = -1;
    if (s->usec) s->t_frame = s->usec();
    if (nbuffers < 2) {
@@ -592,9 +605,11 @@ cv_frame_t cv_frame(cv_state_t *s, int captured, int displayed, int nbuffers,
       // CoCoVGA keeps showing the previous picture while it reads the
       // register page, so don't flip this frame to the screen.
       if (own >= 0) {
-         *redirect = spare_buffer(own, displayed, nbuffers) + 1;
+         *capture_next = spare_buffer(own, displayed, nbuffers);
+         *inhibit_flip = 1;
       } else if (captured != displayed) {
-         *redirect = captured + 1;
+         *capture_next = captured;
+         *inhibit_flip = 1;
       }
       return f;
    }
@@ -623,7 +638,8 @@ cv_frame_t cv_frame(cv_state_t *s, int captured, int displayed, int nbuffers,
       } else {
          cv_render(s, buffer(s->display_buf), pitch, 0);
       }
-      *redirect = spare_buffer(own, displayed, nbuffers) + 1;
+      *capture_next = spare_buffer(own, displayed, nbuffers);
+      *inhibit_flip = 1;
       return f;
    }
 
@@ -634,9 +650,11 @@ cv_frame_t cv_frame(cv_state_t *s, int captured, int displayed, int nbuffers,
       // frame instead of showing the raw CG2 data
       s->entry_holds++;
       if (own >= 0) {
-         *redirect = spare_buffer(own, displayed, nbuffers) + 1;
+         *capture_next = spare_buffer(own, displayed, nbuffers);
+         *inhibit_flip = 1;
       } else if (captured != displayed) {
-         *redirect = captured + 1;
+         *capture_next = captured;
+         *inhibit_flip = 1;
       }
       return f;
    }
@@ -644,10 +662,350 @@ cv_frame_t cv_frame(cv_state_t *s, int captured, int displayed, int nbuffers,
    if (own >= 0) {
       if (++cv_leave_count < CV_LEAVE_FRAMES && (s->regs.enhanced & 0x02)) {
          // ride over a single odd frame
-         *redirect = spare_buffer(own, displayed, nbuffers) + 1;
+         *capture_next = spare_buffer(own, displayed, nbuffers);
+         *inhibit_flip = 1;
          return f;
       }
       cv_stop(s);       // let this frame be flipped to the screen normally
    }
+
+   if (f == CV_FRAME_TEXT && cv_lowercase_on(s)) {
+      // 32 column lower case: fix up a captured screen off screen (within
+      // the work limit, possibly over several frames; newer captures are
+      // skipped meanwhile) and show it when complete. Capture always goes to
+      // a buffer that is not on screen (even with "Num Buffers" = 0), so a
+      // half done fix-up is never seen.
+      if (s->lc_buf < 0) {
+         s->lc_buf = captured;
+         s->lc_pos = 0;
+      }
+      int done;
+      uint8_t *fb = buffer(s->lc_buf);
+      if (lowercase_fast_ok(s, fb, pitch)) {
+         int count = 0;
+         done = lowercase_32_fast(s, fb, pitch, &s->lc_pos, 1, &count);
+      } else {
+         cv_lowercase_32(s, fb, pitch);        // general path: all at once
+         done = 1;
+      }
+      if (done) {
+         *swap_to = s->lc_buf;
+         displayed = s->lc_buf;
+         s->lc_buf = -1;
+      }
+      *capture_next = spare_buffer(s->lc_buf >= 0 ? s->lc_buf : displayed, displayed, nbuffers);
+      *inhibit_flip = 1;
+   } else {
+      s->lc_buf = -1;                           // abandon a fix-up in progress
+   }
    return f;
+}
+
+// ---------------------------------------------------------------------
+// 32 column lower case
+// ---------------------------------------------------------------------
+
+// Fast path. An inverse cell is one of only 64 known glyphs, so far fewer
+// than its 96 dots are needed to tell which one it is:
+//  - the first LC_ID dots below give every 6847 glyph a different pattern
+//    (identification by table lookup)
+//  - all LC_ALL dots are then checked against the identified glyph. Over
+//    these dots any two glyphs differ in at least 3 dots, the same minimum
+//    as over all 96, so it takes 3 wrong dots at once to show a wrong
+//    letter; 1 or 2 wrong dots leave the cell inverse for that frame.
+// The lower case glyph is then written with 32 bit stores (4 pixels each).
+// Used with the profile's double width and height on a 4 pixel boundary;
+// anything else takes the general path below.
+// (dot sets from a greedy search over mc6847_rom_font; checked by the harness)
+#define LC_ID   11
+#define LC_ALL  28
+static const uint8_t lc_dots[LC_ALL][2] = {   // { row, column } in the 8x12 cell
+   {3,3}, {5,2}, {6,4}, {8,6}, {7,4}, {7,3}, {9,3}, {4,6}, {4,5}, {5,3}, {6,6}, {3,2}, {6,3}, {9,6}, {4,3}, {5,4}, {5,6}, {8,2}, {3,5}, {6,5}, {9,5}, {6,2}, {4,4}, {5,5}, {7,2}, {3,6}, {8,3}, {8,5}
+};
+int cv_lowercase_fast = 1;          // 0 = always take the general path (tests)
+static int lc_ready = 0, lc_ok = 0;
+static int8_t lc_map[1 << LC_ID];
+static uint32_t lc_expect[64];
+
+// 'e' ($05) and 'f' ($06) are the one pair that differ in only 3 of the
+// LC_ALL dots above - lc_dots[EF_D0..EF_D2], indices 6/13/20, all row 9 of
+// the cell - and nowhere else, so the ordinary exact match (every dot has
+// to fit) has the least margin for this pair of any in the table: on real
+// hardware they're the letters most likely to be read with a dot wrong and
+// left inverse. {9,4}, a 4th dot where they differ, is read on demand below
+// instead of being added to lc_dots (which would cost every other glyph an
+// extra dot in its signature for no benefit to it).
+#define EF_D0 6     // lc_dots[6]  = {9,3}
+#define EF_D1 13    // lc_dots[13] = {9,6}
+#define EF_D2 20    // lc_dots[20] = {9,5}
+#define EF_MASK ((1u << EF_D0) | (1u << EF_D1) | (1u << EF_D2))
+static const uint8_t ef_extra_dot[2] = { 9, 4 };   // row 9, column 4
+
+// Called only once the ordinary exact match has already failed for a cell
+// whose LC_ID lookup pointed at 'e' or 'f' - i.e. every one of the LC_ALL
+// dots fit one of the two except possibly the row 9 ones. If some other
+// dot is also wrong, this cell isn't really 'e' or 'f' with a bad dot, so
+// bail out exactly as the ordinary check would (returns -1, same as
+// "leave it inverse"). Otherwise decide by a vote over all 4 dots that
+// tell 'e' and 'f' apart (the usual 3, plus the one at column 4 sampled
+// here): a clean majority (3-1 or 4-0) is trusted, a 2-2 split abstains -
+// so this can only ever resolve to 'e', to 'f', or to "leave it inverse",
+// never to any other letter.
+static int ef_tiebreak(const uint8_t *fb, int pitch, int x0, int y0, uint8_t corner, uint8_t light, uint32_t sig) {
+   if ((sig ^ lc_expect[5]) & ~(uint32_t) EF_MASK) return -1;   // a non-row-9 dot is wrong: not this
+   int c4 = fb[(y0 + ef_extra_dot[0] * 2) * pitch + x0 + ef_extra_dot[1] * 2] & CV_CODE_MASK;
+   int bit3;
+   if (c4 == light) bit3 = 1;
+   else if (c4 == corner) bit3 = 0;
+   else return -1;                                             // unreadable: leave it
+   // bit=1 matches 'e' at each of these 4 dots, bit=0 matches 'f' (checked
+   // against mc6847_rom_font by the test harness)
+   int e_votes = ((sig >> EF_D0) & 1) + ((sig >> EF_D1) & 1) + ((sig >> EF_D2) & 1) + bit3;
+   if (e_votes >= 3) return 5;
+   if (e_votes <= 1) return 6;
+   return -1;                                                  // 2-2: genuine tie, leave it
+}
+
+static uint32_t lc_sig_of_glyph(int code) {
+   uint32_t sig = 0;
+   for (int j = 0; j < LC_ALL; j++) {
+      if (mc6847_rom_font[code][lc_dots[j][0]] & (0x80 >> lc_dots[j][1])) sig |= 1u << j;
+   }
+   return sig;
+}
+
+static void lc_init(void) {
+   lc_ready = 1;
+   lc_ok = 0;
+   memset(lc_map, -1, sizeof(lc_map));
+   for (int i = 0; i < 64; i++) {
+      lc_expect[i] = lc_sig_of_glyph(i);
+      unsigned int id = lc_expect[i] & ((1u << LC_ID) - 1);
+      if (lc_map[id] >= 0) return;          // not unique: use the general path
+      lc_map[id] = (int8_t) i;
+   }
+   lc_ok = 1;
+}
+
+// minimum number of dots (of the LC_ALL checked) in which two 6847 glyphs
+// differ; exported for the test harness
+int cv_lowercase_min_distance(void) {
+   if (!lc_ready) lc_init();
+   int m = 99;
+   for (int i = 0; i < 64; i++) {
+      for (int j = i + 1; j < 64; j++) {
+         uint32_t v = lc_expect[i] ^ lc_expect[j];
+         int d = 0;
+         while (v) { d += v & 1; v >>= 1; }
+         if (d < m) m = d;
+      }
+   }
+   return lc_ok ? m : 0;
+}
+
+// cells from *pos on; stops at the work limit (limited != 0) and returns 0,
+// or returns 1 when all 512 cells are done. *count += cells changed.
+static int lowercase_32_fast(cv_state_t *s, uint8_t *fb, int pitch, int *pos, int limited, int *count) {
+   uint32_t keep[24];
+   int keep_row = -1, done = 0, written = 0;
+   const int style = s->lc_font;
+   for (int cell = *pos; cell < 512; cell++) {
+      if (limited && (done & 7) == 0 && done) {
+         if ((s->max_chars && written >= s->max_chars) ||
+             (s->usec && done >= CV_MIN_LC_CELLS && s->usec() - s->t_frame >= s->budget_us)) {
+            *pos = cell;
+            return 0;
+         }
+      }
+      done++;
+      const int cy = cell >> 5, cx = cell & 31;
+      const int y0 = s->oy + cy * 24;
+      const int x0 = s->ox + cx * 16;
+      int corner = fb[y0 * pitch + x0] & CV_CODE_MASK;
+      if (corner != CV_DKGREEN && corner != CV_DKORANGE) continue;
+      const uint8_t light = corner == CV_DKORANGE ? CV_LORANGE : CV_GREEN;
+      uint32_t sig = 0;
+      int ok = 1;
+      for (int j = 0; j < LC_ALL; j++) {
+         int c = fb[(y0 + lc_dots[j][0] * 2) * pitch + x0 + lc_dots[j][1] * 2] & CV_CODE_MASK;
+         if (c == light) sig |= 1u << j;
+         else if (c != corner) { ok = 0; break; }
+      }
+      if (!ok) continue;
+      int code = lc_map[sig & ((1u << LC_ID) - 1)];
+      if (code < 0 || code >= 32) continue;   // $20-$3F stay inverse, as on the 6847T1
+      if (sig != lc_expect[code]) {
+         if (code != 5 && code != 6) continue;        // dots don't fit that glyph: leave it
+         code = ef_tiebreak(fb, pitch, x0, y0, corner, light, sig);
+         if (code < 0) continue;                      // not actually 'e'/'f', or a genuine tie
+      }
+      if (keep_row != cy) {
+         // scanline / upper bits: the same along a frame buffer line
+         for (int l = 0; l < 24; l++) keep[l] = (fb[(y0 + l) * pitch + x0] & ~CV_CODE_MASK) * 0x01010101u;
+         keep_row = cy;
+      }
+      // a pair of dots -> one 32 bit word (2 pixels per dot, little endian)
+      uint32_t pair[4];
+      for (int b = 0; b < 4; b++) {
+         uint32_t c1 = (b & 2) ? corner : light;      // glyph dots are dark
+         uint32_t c2 = (b & 1) ? corner : light;
+         pair[b] = c1 | (c1 << 8) | (c2 << 16) | (c2 << 24);
+      }
+      const uint8_t *glyph = cv_lower_glyph(code, style);   // next to the 6847's capitals
+      const int odd = x0 & 2;                     // cell starts 2 pixels off a word
+      for (int dy = 0; dy < 12; dy++) {
+         const unsigned int g = glyph[dy];
+         const uint32_t w0 = pair[(g >> 6) & 3], w1 = pair[(g >> 4) & 3];
+         const uint32_t w2 = pair[(g >> 2) & 3], w3 = pair[g & 3];
+         for (int k = 0; k < 2; k++) {
+            uint8_t *p = fb + (y0 + dy * 2 + k) * pitch + x0;
+            const uint32_t kw = keep[dy * 2 + k];
+            if (!odd) {
+               uint32_t *q = (uint32_t *) p;
+               q[0] = w0 | kw; q[1] = w1 | kw; q[2] = w2 | kw; q[3] = w3 | kw;
+            } else {
+               // 16 + 32 + 32 + 32 + 16 bit stores
+               ((uint16_t *) p)[0] = (uint16_t) (w0 | kw);
+               ((uint32_t *) (p + 2))[0] = ((w0 >> 16) | (w1 << 16)) | kw;
+               ((uint32_t *) (p + 6))[0] = ((w1 >> 16) | (w2 << 16)) | kw;
+               ((uint32_t *) (p + 10))[0] = ((w2 >> 16) | (w3 << 16)) | kw;
+               ((uint16_t *) (p + 14))[0] = (uint16_t) ((w3 >> 16) | kw);
+            }
+         }
+      }
+      written++;
+   }
+   *pos = 512;
+   *count += written;
+   return 1;
+}
+
+static int lowercase_fast_ok(const cv_state_t *s, const uint8_t *fb, int pitch) {
+   return cv_lowercase_fast && lc_ok && s->hs == 2 && s->vs == 2 && !(s->ox & 1) && !(pitch & 3)
+          && !(((uintptr_t) fb) & 3);
+}
+
+int cv_lowercase_on(const cv_state_t *s) {
+   return s->lc_on_mode < 0 ? (s->regs.font & 0x02) != 0 : s->lc_on_mode;
+}
+
+int cv_lowercase_32(cv_state_t *s, uint8_t *fb, int pitch) {
+   if (!s->cal_valid) return 0;
+   const int hs = s->hs, vs = s->vs;
+   if (!lc_ready) lc_init();
+   if (lowercase_fast_ok(s, fb, pitch)) {
+      int pos = 0, count = 0;
+      lowercase_32_fast(s, fb, pitch, &pos, 0, &count);
+      return count;
+   }
+   int count = 0;
+   const int style = s->lc_font;
+   for (int cy = 0; cy < 16; cy++) {
+      for (int cx = 0; cx < 32; cx++) {
+         int x0 = s->ox + cx * 8 * hs;
+         int y0 = s->oy + cy * 12 * vs;
+         // inverse characters ($00-$3F) have a dark background; every
+         // 6847 glyph leaves the top left dot empty
+         int corner = code_at(fb, pitch, x0, y0);
+         if (corner != CV_DKGREEN && corner != CV_DKORANGE) continue;
+         int css = corner == CV_DKORANGE;
+         uint8_t light = css ? CV_LORANGE : CV_GREEN;
+         uint8_t dark = css ? CV_DKORANGE : CV_DKGREEN;
+         uint8_t strokes[12];
+         int ok = 1;
+         for (int dy = 0; dy < 12 && ok; dy++) {
+            const uint8_t *line = fb + (y0 + dy * vs) * pitch + x0;
+            unsigned int bits = 0;
+            for (int dx = 0; dx < 8; dx++) {
+               int c = line[dx * hs] & CV_CODE_MASK;
+               if (c == light) bits |= 0x80 >> dx;
+               else if (c != dark) { ok = 0; break; }
+            }
+            strokes[dy] = bits;
+         }
+         if (!ok) continue;
+         int code = -1;
+         for (int i = 0; i < 32; i++) {
+            if (memcmp(strokes, mc6847_rom_font[i], 12) == 0) { code = i; break; }
+         }
+         if (code < 0) continue;      // $20-$3F stay inverse, as on the 6847T1
+         const uint8_t *glyph = cv_lower_glyph(code, style);   // next to the 6847's capitals
+         for (int dy = 0; dy < 12; dy++) {
+            for (int k = 0; k < vs; k++) {
+               uint8_t *p = fb + (y0 + dy * vs + k) * pitch + x0;
+               uint8_t keep = p[0] & ~CV_CODE_MASK;    // keep scanline bits
+               for (int dx = 0; dx < 8; dx++) {
+                  uint8_t c = ((glyph[dy] >> (7 - dx)) & 1) ? dark : light;
+                  for (int j = 0; j < hs; j++) *p++ = c | keep;
+               }
+            }
+         }
+         count++;
+      }
+   }
+   return count;
+}
+
+// ---------------------------------------------------------------------
+// MC6847 NTSC artifact colours
+// ---------------------------------------------------------------------
+
+int cv_artifact_index(int first, int second, int mode, int flags) {
+   if (mode == 0 || first == second) return -1;
+   int lit_first;
+   int css;
+   if (first == CV_BLACK && second == CV_BUFF)       { lit_first = 0; css = 1; }
+   else if (first == CV_BUFF && second == CV_BLACK)  { lit_first = 1; css = 1; }
+   else if (first == CV_BLACK && second == CV_GREEN) { lit_first = 0; css = 0; }
+   else if (first == CV_GREEN && second == CV_BLACK) { lit_first = 1; css = 0; }
+   else if ((flags & CV_ART_GREEN_DARK_BG) && first == CV_DKGREEN && second == CV_GREEN) { lit_first = 0; css = 0; }
+   else if ((flags & CV_ART_GREEN_DARK_BG) && first == CV_GREEN && second == CV_DKGREEN) { lit_first = 1; css = 0; }
+   else return -1;
+   int a = (mode == 1) ? lit_first : !lit_first;
+   if (css) return a ? CV_ART_CSS1_A : CV_ART_CSS1_B;
+   return a ? CV_ART_CSS0_A : CV_ART_CSS0_B;
+}
+
+int cv_artifact_flags_for(const uint8_t *fb, int pitch, int x0, int y0, int w, int h) {
+   // The border is green only for graphics modes in the green colour set;
+   // text has a black border. Sample the middle of the capture's first and
+   // last lines (inside the 6847 border); both must be green, so a screen
+   // that switches to text part way down (split screen) keeps plain text.
+   if (w < 64 || h < 8) return 0;
+   int green = 0;
+   const int xm = x0 + w / 2 - 24;
+   for (int x = 0; x < 7; x++) {
+      green += (fb[(y0 + 2) * pitch + xm + x * 8] & CV_CODE_MASK) == CV_GREEN;
+      green += (fb[(y0 + h - 3) * pitch + xm + x * 8] & CV_CODE_MASK) == CV_GREEN;
+   }
+   return green >= 13 ? CV_ART_GREEN_DARK_BG : 0;
+}
+
+void cv_build_artifact_table(uint32_t *table, int mode, int flags) {
+   for (int first = 0; first < 16; first++) {
+      for (int second = 0; second < 16; second++) {
+         int a = cv_artifact_index(first, second, mode, flags);
+         uint32_t w;
+         w = (uint32_t) first * 0x0101u | (uint32_t) second * 0x01010000u;
+         if (a >= 0) w |= (uint32_t) a * 0x01010101u;     // tag both dots, keep their colours
+         table[first | (second << 4)] = w;
+      }
+   }
+}
+
+// Colours of a dot pair on an NTSC monitor, taken from XRoar's simulated
+// composite video (-ccr simulated) of a PMODE 4 test card on an NTSC
+// Dragon: buff set orange-red / blue, green set dark green / mid green.
+int cv_artifact_palette_entry(int index) {
+   int r, g, b;
+   int lit = index & CV_CODE_MASK;
+   switch (index & 0x70) {
+      case CV_ART_CSS1_A: r = 0xA1; g = 0x3E; b = 0x05; if (lit != CV_BUFF && lit != CV_BLACK) return -1; break;   // orange-red
+      case CV_ART_CSS1_B: r = 0x16; g = 0x54; b = 0xFF; if (lit != CV_BUFF && lit != CV_BLACK) return -1; break;   // blue
+      case CV_ART_CSS0_A: r = 0x0F; g = 0x33; b = 0x14; if (lit != CV_GREEN && lit != CV_BLACK && lit != CV_DKGREEN) return -1; break;  // dark green
+      case CV_ART_CSS0_B: r = 0x03; g = 0x80; b = 0x03; if (lit != CV_GREEN && lit != CV_BLACK && lit != CV_DKGREEN) return -1; break;  // mid green
+      default: return -1;
+   }
+   unsigned int m = (299u * r + 587u * g + 114u * b + 500u) / 1000u;
+   return (int) ((m << 24) | ((unsigned) b << 16) | ((unsigned) g << 8) | (unsigned) r);
 }

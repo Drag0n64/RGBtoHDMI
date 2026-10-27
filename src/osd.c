@@ -18,6 +18,7 @@
 #include "8x8_font.h"
 #include "rgb_to_fb.h"
 #include "rgb_to_hdmi.h"
+#include "cocovga.h"
 #include "filesystem.h"
 #include "fatfs/ff.h"
 #include "jtag/update_cpld.h"
@@ -182,6 +183,19 @@ static const char *deinterlace_names[] = {
 };
 
 #ifdef MULTI_BUFFER
+static const char *artifact6847_names[] = {
+   "Off",
+   "Red/Blue",
+   "Blue/Red"
+};
+
+static const char *cocovga_lc_font_names[] = {
+   "Auto",
+   "Off",
+   "CoCoVGA",
+   "Dragon 200-E"
+};
+
 static const char *nbuffer_names[] = {
    "1",
    "2",
@@ -491,6 +505,8 @@ static param_t features[] = {
    {      F_INTEGER_ASPECT,"Integer Aspect Ratio",    "integer_aspect", 0, NUM_INTEGER_ASPECT-1, 1, 1 },
    {     F_INTEGER_SCALING,"16:9 Integer Scaling", "integer_scaling", 0, NUM_INTEGER_SCALING-1, 1, 1 },
    {           F_COCOVGA,    "CoCoVGA 64 Col",           "cocovga", 0,                    1, 1, 1 },
+   {      F_ARTIFACT6847,    "6847 Artifacts",   "mc6847_artifact", 0,                    2, 1, 1 },
+   {   F_COCOVGA_LC_FONT, "32 Col Lower Case","cocovga_lower_case", 0,                   3, 1, 1 },
 
    {         F_PROFILE_NUM,"Custom Profile Num",    "profile_number", 0,                  9, 1, 0 },
    {             F_H_WIDTH,       "Pixel Width",       "pixel_width", 120,               1920, 8, 0 },
@@ -785,6 +801,8 @@ static param_menu_item_t capscale_ref        = { I_FEATURE, &features[F_SCREENCA
 static param_menu_item_t border_ref          = { I_FEATURE, &features[F_BORDER_COLOUR]    };
 static param_menu_item_t palettecontrol_ref  = { I_FEATURE, &features[F_PALETTE_CONTROL]  };
 static param_menu_item_t cocovga_ref         = { I_FEATURE, &features[F_COCOVGA]          };
+static param_menu_item_t artifact6847_ref    = { I_FEATURE, &features[F_ARTIFACT6847]     };
+static param_menu_item_t cocovga_lc_font_ref = { I_FEATURE, &features[F_COCOVGA_LC_FONT]  };
 static param_menu_item_t ntsccolour_ref      = { I_FEATURE, &features[F_NTSC_COLOUR]      };
 static param_menu_item_t ntscphase_ref       = { I_FEATURE, &features[F_NTSC_PHASE]       };
 static param_menu_item_t ntsctype_ref        = { I_FEATURE, &features[F_NTSC_TYPE]        };
@@ -954,6 +972,8 @@ static menu_t palette_menu = {
       (base_menu_item_t *) &tint_ref,
       (base_menu_item_t *) &palettecontrol_ref,
       (base_menu_item_t *) &cocovga_ref,
+      (base_menu_item_t *) &artifact6847_ref,
+      (base_menu_item_t *) &cocovga_lc_font_ref,
       (base_menu_item_t *) &ntsccolour_ref,
       (base_menu_item_t *) &ntscphase_ref,
       (base_menu_item_t *) &ntsctype_ref,
@@ -1908,6 +1928,10 @@ static const char *get_param_string(param_menu_item_t *param_item) {
       case F_GENLOCK_ADJUST:
          return genlock_adjust_names[value];
 #ifdef MULTI_BUFFER
+      case F_ARTIFACT6847:
+         return artifact6847_names[value];
+      case F_COCOVGA_LC_FONT:
+         return cocovga_lc_font_names[value];
       case F_NUM_BUFFERS:
          return nbuffer_names[value];
 #endif
@@ -5870,6 +5894,13 @@ void osd_update_palette(int hardware_direct) {
                 i_adj ^= 0x12;
             }
             palette_data[i] = palette_array[get_parameter(F_PALETTE)][i_adj];
+            // MC6847 NTSC artifact colours (see capture_line_mc6847_8bpp.S)
+            if (get_parameter(F_ARTIFACT6847) && get_parameter(F_PALETTE_CONTROL) == PALETTECONTROL_C64_LUMACODE) {
+                int artifact = cv_artifact_palette_entry(i & 0x7f);
+                if (artifact >= 0) {
+                    palette_data[i] = artifact;
+                }
+            }
         }
         palette_data[i] = adjust_palette(palette_data[i]);
     }
@@ -8404,6 +8435,9 @@ void osd_init() {
       // older Default.txt files don't have the CoCoVGA setting: default it to
       // off so it doesn't carry over from the MC6847 profile to others
       strcat(default_buffer, "\r\ncocovga=0\r\n");
+   }
+   if (bytes != 0 && strstr(default_buffer, "mc6847_artifact=") == NULL && strlen(default_buffer) + 24 < MAX_BUFFER_SIZE - 4) {
+      strcat(default_buffer, "\r\nmc6847_artifact=0\r\n");
    }
    if (bytes != 0) {
       size_t count = 0;

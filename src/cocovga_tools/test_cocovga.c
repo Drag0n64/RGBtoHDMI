@@ -233,6 +233,22 @@ typedef struct {
    int last, displayed, redirect;
 } sim_t;
 
+// artifact mode emulation: the capture routine replaces every dot pair
+// (4 fb pixels, word aligned) with the pair table entry
+static uint32_t sim_artifact_table[256];
+static int sim_artifacts = 0;
+
+static void apply_artifact_table(uint8_t *fb, const gen_geom_t *g) {
+   for (int y = 0; y < g->fb_h; y++) {
+      uint8_t *line = fb + y * g->pitch;
+      for (int x = 0; x + 3 < g->fb_w; x += 4) {
+         int first = line[x] & 15, second = line[x + 2] & 15;
+         uint32_t w = sim_artifact_table[first | (second << 4)];
+         for (int i = 0; i < 4; i++) line[x + i] = (w >> (8 * i)) & 0xFF;
+      }
+   }
+}
+
 // optional change to each generated frame before cv_frame sees it
 static void (*sim_tamper)(uint8_t *fb, const gen_geom_t *g);
 
@@ -243,12 +259,13 @@ static int sim_capture(sim_t *m, cv_state_t *s, const gen_geom_t *g, gen_mode_t 
    else cap = (m->last + 1) & 3;
    gen_frame(sim_buffers[cap], g, mode, vram, css, 0);
    if (sim_tamper) sim_tamper(sim_buffers[cap], g);
-   int redirect, swap;
-   cv_frame_t f = cv_frame(s, cap, m->displayed, 4, sim_buffer, g->pitch, g->fb_w, g->fb_h, &redirect, &swap);
+   if (sim_artifacts) apply_artifact_table(sim_buffers[cap], g);
+   int capture_next, inhibit, swap;
+   cv_frame_t f = cv_frame(s, cap, m->displayed, 4, sim_buffer, g->pitch, g->fb_w, g->fb_h, &capture_next, &inhibit, &swap);
    if (swap >= 0) m->displayed = swap;
    m->last = cap;
-   if (!redirect) m->displayed = cap;
-   m->redirect = redirect;
+   if (!inhibit) m->displayed = cap;
+   m->redirect = capture_next + 1;
    if (captured_out) *captured_out = cap;
    return f;
 }
@@ -331,7 +348,7 @@ static void test_end_to_end(void) {
          memcpy(text, "\x4F\x4B", 2);
          for (int i = 0; i < 3; i++) sim_capture(&m, &s, g, GEN_TEXT, text, 0, NULL);
          gen_frame(expect, g, GEN_TEXT, text, 0, 0);
-         CHECK(!s.w64_on && m.redirect == 0, "geom %d nb %d: W64 not left", k, nb);
+         CHECK(!s.w64_on && m.redirect - 1 != m.displayed, "geom %d nb %d: W64 not left", k, nb);
          CHECK(memcmp(sim_buffers[m.displayed], expect, (size_t)g->pitch * g->fb_h) == 0, "geom %d nb %d: text screen after W64", k, nb);
 
          for (int i = 0; i < 4; i++) free(sim_buffers[i]);
@@ -352,7 +369,16 @@ static void write_ppm(const char *name, const uint8_t *fb, const gen_geom_t *g) 
    if (!f) return;
    fprintf(f, "P6\n%d %d\n255\n", g->fb_w, g->fb_h);
    for (int y = 0; y < g->fb_h; y++)
-      for (int x = 0; x < g->fb_w; x++) fwrite(pal[fb[y * g->pitch + x] & 15], 1, 3, f);
+      for (int x = 0; x < g->fb_w; x++) {
+         int v = fb[y * g->pitch + x];
+         int art = cv_artifact_palette_entry(v & 0x7f);
+         if (art >= 0) {
+            uint8_t rgb[3] = { (uint8_t)(art & 0xFF), (uint8_t)((art >> 8) & 0xFF), (uint8_t)((art >> 16) & 0xFF) };
+            fwrite(rgb, 1, 3, f);
+         } else {
+            fwrite(pal[v & 15], 1, 3, f);
+         }
+      }
    fclose(f);
 }
 
@@ -517,6 +543,459 @@ static void test_sliced_decode(void) {
 }
 
 // ---------------------------------------------------------------------
+// Stage 2: 32 column lower case
+// ---------------------------------------------------------------------
+static int cell_matches(const uint8_t *fb, const gen_geom_t *g, int cx, int cy, const uint8_t *glyph, uint8_t stroke, uint8_t bg) {
+   int bad = 0;
+   for (int dy = 0; dy < 12; dy++)
+      for (int dx = 0; dx < 8; dx++) {
+         uint8_t want = ((glyph[dy] >> (7 - dx)) & 1) ? stroke : bg;
+         for (int yy = 0; yy < g->vs; yy++)
+            for (int xx = 0; xx < g->hs; xx++) {
+               int x = g->ox + (cx * 8 + dx) * g->hs + xx, y = g->oy + (cy * 12 + dy) * g->vs + yy;
+               if ((fb[y * g->pitch + x] & 15) != want) bad++;
+            }
+      }
+   return bad;
+}
+
+static void test_lowercase_32(void) {
+   // font bit 1 = lower case, bit 0 = T1 shapes (left 0: this test checks
+   // the plain 6847 glyphs; test_lowercase_t1_select covers bit 0 itself)
+   static const uint8_t lower_on[9] = { 0x00, 0x01, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00 };
+   for (int k = 0; k < NGEOMS; k++) {
+      const gen_geom_t *g = &geoms[k];
+      for (int nb = 0; nb < 4; nb += 3) {
+         for (int css = 0; css < 2; css++) {
+            for (int i = 0; i < 4; i++) sim_buffers[i] = alloc_fb(g);
+            sim_t m = { nb, 0, 0, 0 };
+            cv_state_t s; cv_init(&s);
+            uint8_t text[512];
+            make_text_page(text, NULL);
+            sim_capture(&m, &s, g, GEN_TEXT, text, css, NULL);
+            make_text_page(text, lower_on);
+            sim_capture(&m, &s, g, GEN_TEXT, text, 0, NULL);
+            CHECK(s.regs.font == 2, "geom %d: font register for lower case", k);
+            // BASIC screen: row 1 = every inverse code, row 2 normal, row 3 SG4
+            make_text_page(text, NULL);
+            for (int i = 0; i < 64; i++) text[32 + i] = i;            // rows 1-2
+            for (int i = 0; i < 32; i++) text[96 + i] = 0x40 | i;     // row 3
+            for (int i = 0; i < 32; i++) text[128 + i] = 0x80 | (i * 4); // row 4
+            int captured;
+            for (int n = 0; n < 3; n++) sim_capture(&m, &s, g, GEN_TEXT, text, css, &captured);
+            const uint8_t *fb = sim_buffers[m.displayed];
+            uint8_t light = css ? CV_LORANGE : CV_GREEN, dark = css ? CV_DKORANGE : CV_DKGREEN;
+            int bad = 0;
+            for (int i = 0; i < 64; i++) {
+               int cx = i & 31, cy = 1 + (i >> 5);
+               if (i < 32) bad += cell_matches(fb, g, cx, cy, cv_lower_glyph(i, 0), dark, light) != 0;
+               else        bad += cell_matches(fb, g, cx, cy, mc6847_rom_font[i], light, dark) != 0;   // stays inverse
+            }
+            for (int i = 0; i < 32; i++) bad += cell_matches(fb, g, i, 3, mc6847_rom_font[i], dark, light) != 0;
+            CHECK(bad == 0, "geom %d nb %d css %d: %d cells wrong in 32 column lower case", k, nb, css, bad);
+            // fixed up frames are never captured into the buffer on screen
+            sim_capture(&m, &s, g, GEN_TEXT, text, css, &captured);
+            int next = m.redirect - 1;
+            CHECK(next >= 0 && next != m.displayed, "geom %d nb %d: next capture lands on screen", k, nb);
+            // lower case off again: inverse characters come back
+            static const uint8_t lower_off[9] = { 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
+            uint8_t regs[512];
+            make_text_page(regs, lower_off);
+            sim_capture(&m, &s, g, GEN_TEXT, regs, 0, NULL);
+            for (int n = 0; n < 2; n++) sim_capture(&m, &s, g, GEN_TEXT, text, css, NULL);
+            fb = sim_buffers[m.displayed];
+            CHECK(cell_matches(fb, g, 1, 1, mc6847_rom_font[1], light, dark) == 0, "geom %d: inverse A after lower case off", k);
+            for (int i = 0; i < 4; i++) free(sim_buffers[i]);
+         }
+      }
+   }
+}
+
+// Which glyphs the 32 column lower case fixup draws for an inverse cell:
+// s->lc_font (CoCoVGA or Dragon 200-E), whatever the font register's T1 bit
+// says (T1 shapes are only for W64 with T1 capitals). Checked on both the
+// fast and general paths.
+extern int cv_lowercase_fast;
+static void test_lowercase_font_select(void) {
+   const gen_geom_t *g = &geoms[0];
+   uint8_t *fb = alloc_fb(g), *orig = alloc_fb(g);
+   uint8_t text[512];
+   for (int i = 0; i < 512; i++) text[i] = (uint8_t) (i & 31);   // every cell inverse $00-$1F
+   cv_state_t s; cv_init(&s);
+   CHECK(s.lc_font == CV_LC_COCOVGA, "lower case font defaults to CoCoVGA");
+   gen_frame(orig, g, GEN_TEXT, text, 0, 0);
+   CHECK(cv_analyze(&s, orig, g->pitch, g->fb_w, g->fb_h) == CV_FRAME_TEXT, "font select: calibrate");
+
+   static const struct { int font_t1_bit, lc_font; const char *label; } cases[] = {
+      { 0, CV_LC_COCOVGA,    "CoCoVGA, register plain" },
+      { 1, CV_LC_COCOVGA,    "CoCoVGA, register T1" },
+      { 0, CV_LC_DRAGON200E, "Dragon 200-E, register plain" },
+      { 1, CV_LC_DRAGON200E, "Dragon 200-E, register T1" },
+   };
+   for (unsigned int c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+      for (int fast = 0; fast < 2; fast++) {
+         s.regs.font = (uint8_t) (0x02 | cases[c].font_t1_bit);
+         s.lc_font = cases[c].lc_font;
+         memcpy(fb, orig, (size_t)g->pitch * g->fb_h);
+         cv_lowercase_fast = fast;
+         cv_lowercase_32(&s, fb, g->pitch);
+         cv_lowercase_fast = 1;
+         int bad = 0;
+         for (int i = 0; i < 512; i++)
+            bad += cell_matches(fb, g, i & 31, i >> 5, cv_lower_glyph(i & 31, cases[c].lc_font), CV_DKGREEN, CV_GREEN) != 0;
+         CHECK(bad == 0, "font select (%s path) %s: %d cells wrong", fast ? "fast" : "general", cases[c].label, bad);
+      }
+   }
+   // the 200-E glyphs are the ROM's, on the 6847 capitals' baseline (row 9)
+   CHECK(cv_lower_glyph(1, CV_LC_DRAGON200E) == dragon200e_lower_font[1], "200-E 'a' from the ROM table");
+   CHECK(dragon200e_lower_font[1][9] != 0 && dragon200e_lower_font[1][10] == 0, "200-E 'a' sits on row 9");
+   CHECK(dragon200e_lower_font[7][10] != 0, "200-E 'g' descends below row 9");
+   int differ = 0;
+   for (int c = 1; c <= 26; c++) differ += memcmp(cv_lower_glyph(c, CV_LC_COCOVGA), cv_lower_glyph(c, CV_LC_DRAGON200E), 12) != 0;
+   CHECK(differ > 0, "200-E and CoCoVGA lower case differ");
+   free(fb); free(orig);
+}
+
+// The menu can turn 32 column lower case on or off regardless of the CoCoVGA
+// register page (s->lc_on_mode 1 / 0): BASIC typing after SHIFT-0, with no
+// register page ever written, comes out as lower case when forced on, and a
+// register page asking for lower case is ignored when forced off.
+static void test_lowercase_forced(void) {
+   static const uint8_t lower_on[9] = { 0x00, 0x01, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00 };
+   static const struct { int write_regs, on_mode, font, expect_lower; const char *label; } cases[] = {
+      { 0, -1, CV_LC_COCOVGA,    0, "auto, no register page" },
+      { 1, -1, CV_LC_COCOVGA,    1, "auto, register page lower case" },
+      { 0,  1, CV_LC_COCOVGA,    1, "forced CoCoVGA, no register page" },
+      { 0,  1, CV_LC_DRAGON200E, 1, "forced Dragon 200-E, no register page" },
+      { 1,  0, CV_LC_COCOVGA,    0, "forced off, register page lower case" },
+   };
+   for (int k = 0; k < 2; k++) {
+      const gen_geom_t *g = &geoms[k];
+      for (unsigned int c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+         for (int i = 0; i < 4; i++) sim_buffers[i] = alloc_fb(g);
+         sim_t m = { 3, 0, 0, 0 };
+         cv_state_t s; cv_init(&s);
+         s.lc_on_mode = cases[c].on_mode;
+         s.lc_font = cases[c].font;
+         uint8_t text[512];
+         make_text_page(text, NULL);
+         sim_capture(&m, &s, g, GEN_TEXT, text, 0, NULL);
+         if (cases[c].write_regs) {
+            make_text_page(text, lower_on);
+            sim_capture(&m, &s, g, GEN_TEXT, text, 0, NULL);
+         }
+         make_text_page(text, NULL);
+         for (int i = 0; i < 32; i++) text[64 + i] = i;     // row 2: inverse $00-$1F
+         for (int n = 0; n < 3; n++) sim_capture(&m, &s, g, GEN_TEXT, text, 0, NULL);
+         CHECK(cv_lowercase_on(&s) == cases[c].expect_lower, "geom %d %s: lower case on", k, cases[c].label);
+         const uint8_t *fb = sim_buffers[m.displayed];
+         int bad = 0;
+         for (int i = 0; i < 32; i++) {
+            if (cases[c].expect_lower)
+               bad += cell_matches(fb, g, i, 2, cv_lower_glyph(i, cases[c].font), CV_DKGREEN, CV_GREEN) != 0;
+            else
+               bad += cell_matches(fb, g, i, 2, mc6847_rom_font[i], CV_GREEN, CV_DKGREEN) != 0;
+         }
+         CHECK(bad == 0, "geom %d %s: %d cells wrong", k, cases[c].label, bad);
+         for (int i = 0; i < 4; i++) free(sim_buffers[i]);
+      }
+   }
+}
+
+// ---------------------------------------------------------------------
+// Stage 2: NTSC artifact colours
+// ---------------------------------------------------------------------
+static void test_artifacts(void) {
+   // table: only black/green and black/buff pairs change
+   for (int mode = 0; mode < 3; mode++) {
+      cv_build_artifact_table(sim_artifact_table, mode, 0);
+      int changed = 0;
+      for (int a = 0; a < 16; a++)
+         for (int b = 0; b < 16; b++) {
+            uint32_t w = sim_artifact_table[a | (b << 4)];
+            uint32_t plain = a * 0x0101u | b * 0x01010000u;
+            CHECK((w & 0x0F0F0F0Fu) == plain, "mode %d: pair %d,%d lost its colours", mode, a, b);
+            if (w != plain) {
+               changed++;
+               int ok = mode && a != b && ((a == CV_BLACK && (b == CV_GREEN || b == CV_BUFF)) || (b == CV_BLACK && (a == CV_GREEN || a == CV_BUFF)));
+               CHECK(ok, "mode %d: pair %d,%d changed", mode, a, b);
+            }
+         }
+      CHECK(changed == (mode ? 4 : 0), "mode %d: %d pairs changed", mode, changed);
+   }
+   CHECK(cv_artifact_index(CV_BUFF, CV_BLACK, 1, 0) == cv_artifact_index(CV_BLACK, CV_BUFF, 2, 0), "phase swap");
+   CHECK(cv_artifact_palette_entry(CV_ART_CSS1_A | CV_BUFF) > 0 && cv_artifact_palette_entry(CV_ART_CSS1_A | CV_BLACK) == cv_artifact_palette_entry(CV_ART_CSS1_A | CV_BUFF)
+         && cv_artifact_palette_entry(0x05) == -1, "palette entries");
+   // green set graphics with a dark green background (XRoar): only with the flag
+   CHECK(cv_artifact_index(CV_DKGREEN, CV_GREEN, 1, 0) == -1 && cv_artifact_index(CV_DKGREEN, CV_GREEN, 1, CV_ART_GREEN_DARK_BG) == CV_ART_CSS0_B
+         && cv_artifact_index(CV_GREEN, CV_DKGREEN, 1, CV_ART_GREEN_DARK_BG) == CV_ART_CSS0_A, "dark green background pairs");
+
+   // with artifacts on in the capture, only RG6 pictures change, and the
+   // CoCoVGA emulation still works (word aligned geometries)
+   cv_build_artifact_table(sim_artifact_table, 1, 0);
+   uint8_t vram[6144];
+   for (int k = 0; k < NGEOMS; k++) {
+      const gen_geom_t *g = &geoms[k];
+      if (g->hs != 2 || g->vs != 2 || (g->ox & 3)) continue;
+      uint8_t *a = alloc_fb(g), *b = alloc_fb(g);
+      static const gen_mode_t modes[] = { GEN_TEXT, GEN_CG1, GEN_CG2, GEN_CG3, GEN_CG6, GEN_RG6 };
+      for (int mi = 0; mi < 6; mi++) {
+         for (int css = 0; css < 2; css++) {
+            for (int i = 0; i < 6144; i++) vram[i] = rnd() & 0xFF;
+            gen_frame(a, g, modes[mi], vram, css, 0);
+            memcpy(b, a, (size_t)g->pitch * g->fb_h);
+            apply_artifact_table(b, g);
+            int diff = memcmp(a, b, (size_t)g->pitch * g->fb_h) != 0;
+            CHECK(diff == (modes[mi] == GEN_RG6), "geom %d mode %d css %d: artifacts changed=%d", k, modes[mi], css, diff);
+         }
+      }
+      free(a); free(b);
+      // full NitrOS-9 sequence with artifacts on
+      for (int i = 0; i < 4; i++) sim_buffers[i] = alloc_fb(g);
+      sim_artifacts = 1;
+      sim_t m = { 0, 0, 0, 0 };
+      cv_state_t s; cv_init(&s);
+      uint8_t text[512], v[2048];
+      make_text_page(text, NULL);
+      sim_capture(&m, &s, g, GEN_TEXT, text, 0, NULL);
+      make_text_page(text, nitros9_regs);
+      sim_capture(&m, &s, g, GEN_TEXT, text, 0, NULL);
+      memset(v, 0x60, sizeof(v));
+      put_text(v, 0, 0, "artifacts on: still 64 columns");
+      for (int i = 0; i < 2; i++) sim_capture(&m, &s, g, GEN_CG2, v, 0, NULL);
+      CHECK(s.w64_on && compare_w64(sim_buffers[m.displayed], g, v, 0x03, 0) == 0, "geom %d: W64 with artifacts on", k);
+      sim_artifacts = 0;
+      for (int i = 0; i < 4; i++) free(sim_buffers[i]);
+   }
+}
+
+static void make_artifact_preview(void) {
+   const gen_geom_t *g = &geoms[0];
+   uint8_t vram[6144], *fb = alloc_fb(g);
+   // PMODE 4 test card: vertical stripes of 1, 2 and 4 dots, solid, checks
+   for (int y = 0; y < 192; y++)
+      for (int b = 0; b < 32; b++) {
+         uint8_t v;
+         if (b < 8) v = 0xAA; else if (b < 16) v = 0x55; else if (b < 20) v = 0xCC; else if (b < 24) v = 0xFF;
+         else v = (y & 1) ? 0xAA : 0x55;
+         vram[y * 32 + b] = v;
+      }
+   cv_build_artifact_table(sim_artifact_table, 1, 0);
+   gen_frame(fb, g, GEN_RG6, vram, 1, 0);
+   apply_artifact_table(fb, g);
+   write_ppm("preview_artifacts.ppm", fb, g);
+   free(fb);
+}
+
+// Fast 32 column lower case path must give the same picture as the general one
+extern int cv_lowercase_fast;
+static void test_lowercase_fast(void) {
+   for (int k = 0; k < NGEOMS; k++) {
+      const gen_geom_t *g = &geoms[k];
+      if (g->hs != 2 || g->vs != 2) continue;
+      uint8_t *a = alloc_fb(g), *b = alloc_fb(g);
+      uint8_t text[512];
+      for (int i = 0; i < 512; i++) text[i] = (uint8_t) ((i * 37) & 0x7F);   // inverse + normal
+      for (int i = 0; i < 64; i++) text[i] = (uint8_t) i;                     // every inverse code
+      for (int i = 448; i < 480; i++) text[i] = (uint8_t) (0x80 | (i & 0x7F)); // semigraphics
+      for (int css = 0; css < 2; css++) {
+         for (unsigned int noise = 0; noise < 2; noise++) {
+            cv_state_t s; cv_init(&s);
+            gen_frame(a, g, GEN_TEXT, text, css, 0);
+            CHECK(cv_analyze(&s, a, g->pitch, g->fb_w, g->fb_h) == CV_FRAME_TEXT, "geom %d: calibrate", k);
+            s.regs.font = 0x02;   // lower case on, T1 shapes off - see test_lowercase_32
+            gen_frame(a, g, GEN_TEXT, text, css, noise ? 77 + k : 0);
+            memcpy(b, a, (size_t)g->pitch * g->fb_h);
+            cv_lowercase_fast = 1;
+            int na = cv_lowercase_32(&s, a, g->pitch);
+            cv_lowercase_fast = 0;
+            int nb = cv_lowercase_32(&s, b, g->pitch);
+            cv_lowercase_fast = 1;
+            CHECK(na == nb && na > 32, "geom %d css %d noise %u: %d / %d cells", k, css, noise, na, nb);
+            int diff = 0;
+            for (size_t i = 0; i < (size_t)g->pitch * g->fb_h; i++) {
+               if (noise ? ((a[i] ^ b[i]) & CV_CODE_MASK) : (a[i] != b[i])) diff++;
+            }
+            CHECK(diff == 0, "geom %d css %d noise %u: fast and general lower case differ in %d pixels", k, css, noise, diff);
+         }
+      }
+      free(a); free(b);
+   }
+}
+
+// Wrong dots in an inverse cell must never turn into a wrong lower case letter
+static void test_lowercase_dot_errors(void) {
+   CHECK(cv_lowercase_min_distance() >= 3, "lower case dot set: min distance %d", cv_lowercase_min_distance());
+   const gen_geom_t *g = &geoms[0];
+   uint8_t *fb = alloc_fb(g), *orig = alloc_fb(g);
+   uint8_t text[512];
+   memset(text, 0x60, sizeof(text));
+   for (int i = 0; i < 32; i++) text[i] = (uint8_t) i;           // row 0: inverse $00-$1F
+   for (int i = 0; i < 32; i++) text[32 + i] = (uint8_t) (32 + i); // row 1: inverse $20-$3F
+   cv_state_t s; cv_init(&s);
+   gen_frame(orig, g, GEN_TEXT, text, 0, 0);
+   CHECK(cv_analyze(&s, orig, g->pitch, g->fb_w, g->fb_h) == CV_FRAME_TEXT, "dot errors: calibrate");
+   s.regs.font = 0x02;   // lower case on, T1 shapes off - see test_lowercase_32
+   unsigned int r = 99;
+   int wrong = 0, kept = 0, fixed = 0;
+   for (int trial = 0; trial < 6000; trial++) {
+      memcpy(fb, orig, (size_t)g->pitch * g->fb_h);
+      int cell = trial % 64, cx = cell & 31, cy = cell >> 5;
+      int flips = 1 + (trial / 64) % 2;               // 1 or 2 wrong dots
+      for (int f = 0; f < flips; f++) {
+         r = r * 1103515245u + 12345u;
+         int d = (int) ((r >> 16) % 96), dy = d / 8, dx = d % 8;
+         for (int y = 0; y < 2; y++) for (int x = 0; x < 2; x++) {
+            uint8_t *p = fb + (g->oy + (cy * 12 + dy) * 2 + y) * g->pitch + g->ox + (cx * 8 + dx) * 2 + x;
+            *p = (*p == CV_GREEN) ? CV_DKGREEN : CV_GREEN;
+         }
+      }
+      cv_lowercase_32(&s, fb, g->pitch);
+      // what does the cell show now?
+      int shown = -1;
+      for (int code = 0; code < 32 && shown < 0; code++) {
+         if (cell_matches(fb, g, cx, cy, cv_lower_glyph(code, 0), CV_DKGREEN, CV_GREEN) == 0) shown = code;
+      }
+      if (shown < 0) kept++;
+      else if (shown == cell) fixed++;
+      else wrong++;
+   }
+   CHECK(wrong == 0, "dot errors: %d cells showed a wrong lower case letter", wrong);
+   printf("  lower case with 1-2 wrong dots: %d right letter, %d left inverse, %d wrong\n", fixed, kept, wrong);
+   free(fb); free(orig);
+}
+
+// 'e' ($05) and 'f' ($06) differ only at row 9, columns 3/4/5/6 (the rest
+// of their 96 dots are identical) - the drill-down that resolves them by a
+// vote over those 4 dots when the ordinary exact match fails. Flip exactly
+// one of the 4: still resolves to the right letter. Flip exactly two (every
+// pairing): a genuine 2-2 tie, so it must abstain (stay inverse), never
+// show either letter, let alone a third one. This exercises what the
+// random 1-2 dot test above only hits by chance.
+static void test_ef_tiebreak(void) {
+   static const int ef_cols[4] = { 3, 4, 5, 6 };   // row 9, columns that tell 'e' and 'f' apart
+   const gen_geom_t *g = &geoms[0];
+   uint8_t *fb = alloc_fb(g), *orig = alloc_fb(g);
+   uint8_t text[512];
+   memset(text, 0x60, sizeof(text));
+   text[0] = 0x05;   // cell 0: 'E' inverse
+   text[1] = 0x06;   // cell 1: 'F' inverse
+   cv_state_t s; cv_init(&s);
+   gen_frame(orig, g, GEN_TEXT, text, 0, 0);
+   CHECK(cv_analyze(&s, orig, g->pitch, g->fb_w, g->fb_h) == CV_FRAME_TEXT, "ef tiebreak: calibrate");
+   s.regs.font = 0x02;   // lower case on, T1 shapes off - see test_lowercase_32
+   for (int cell = 0; cell < 2; cell++) {
+      int want = cell == 0 ? 5 : 6, other = cell == 0 ? 6 : 5;
+      // every single column (1 dot wrong) and every pair of columns (2 dots
+      // wrong) among the 4 that distinguish 'e' and 'f'
+      for (int c0 = 0; c0 < 4; c0++) {
+         for (int c1 = c0; c1 < 4; c1++) {
+            int flips = (c0 == c1) ? 1 : 2;
+            int cols[2] = { ef_cols[c0], ef_cols[c1] };
+            memcpy(fb, orig, (size_t)g->pitch * g->fb_h);
+            for (int i = 0; i < flips; i++) {
+               int dy = 9, dx = cols[i];
+               for (int y = 0; y < 2; y++) for (int x = 0; x < 2; x++) {
+                  uint8_t *p = fb + (g->oy + dy * 2 + y) * g->pitch + g->ox + (cell * 8 + dx) * 2 + x;
+                  *p = (*p == CV_GREEN) ? CV_DKGREEN : CV_GREEN;
+               }
+            }
+            uint8_t *noisy = alloc_fb(g);
+            memcpy(noisy, fb, (size_t)g->pitch * g->fb_h);    // the (possibly corrupted) cell before the pass
+            cv_lowercase_32(&s, fb, g->pitch);
+            int shown_want = cell_matches(fb, g, cell, 0, cv_lower_glyph(want, 0), CV_DKGREEN, CV_GREEN) == 0;
+            int shown_other = cell_matches(fb, g, cell, 0, cv_lower_glyph(other, 0), CV_DKGREEN, CV_GREEN) == 0;
+            int untouched = 1;
+            for (int dy = 0; dy < 24 && untouched; dy++)
+               for (int dx = 0; dx < 16 && untouched; dx++)
+                  if (fb[(g->oy + dy) * g->pitch + g->ox + cell * 16 + dx] !=
+                      noisy[(g->oy + dy) * g->pitch + g->ox + cell * 16 + dx]) untouched = 0;
+            free(noisy);
+            CHECK(shown_want + shown_other + (untouched ? 1 : 0) == 1,
+                  "ef tiebreak: cell %d flips %d cols %d,%d: ambiguous display", cell, flips, cols[0], cols[1]);
+            CHECK(!shown_other, "ef tiebreak: cell %d flips %d cols %d,%d: showed the wrong letter of the pair",
+                  cell, flips, cols[0], cols[1]);
+            if (flips == 1) CHECK(shown_want, "ef tiebreak: cell %d 1 dot wrong (col %d): did not resolve", cell, cols[0]);
+            if (flips == 2) CHECK(untouched, "ef tiebreak: cell %d 2 dots wrong (cols %d,%d): did not abstain", cell, cols[0], cols[1]);
+         }
+      }
+   }
+   free(fb); free(orig);
+}
+
+// Green set artifact table: decided from the capture's border wherever the
+// capture sits in the frame buffer; split screens (text below) stay plain
+static void test_artifact_flags(void) {
+   static const gen_geom_t pad = { 800, 560, 800, 64 + 80, 48 + 40, 2, 2 };  // capture at 80,40 640x480
+   uint8_t vram[6144];
+   for (int i = 0; i < 6144; i++) vram[i] = rnd() & 0xFF;
+   uint8_t text[512];
+   make_text_page(text, NULL);
+   const gen_geom_t *g = &geoms[0];
+   uint8_t *fb = alloc_fb(g);
+   gen_frame(fb, g, GEN_RG6, vram, 0, 0);
+   CHECK(cv_artifact_flags_for(fb, g->pitch, 0, 0, 640, 480) == CV_ART_GREEN_DARK_BG, "flags: green PMODE 4");
+   gen_frame(fb, g, GEN_RG6, vram, 1, 0);
+   CHECK(cv_artifact_flags_for(fb, g->pitch, 0, 0, 640, 480) == 0, "flags: buff PMODE 4");
+   gen_frame(fb, g, GEN_TEXT, text, 0, 0);
+   CHECK(cv_artifact_flags_for(fb, g->pitch, 0, 0, 640, 480) == 0, "flags: text");
+   gen_frame(fb, g, GEN_RG6, vram, 0, 0);
+   memset(fb + 300 * g->pitch, CV_BLACK, (size_t) g->pitch * 180);       // text below
+   CHECK(cv_artifact_flags_for(fb, g->pitch, 0, 0, 640, 480) == 0, "flags: split screen");
+   free(fb);
+   fb = alloc_fb(&pad);
+   gen_frame(fb, &pad, GEN_RG6, vram, 0, 0);
+   for (int y = 0; y < pad.fb_h; y++)                                     // padding outside the capture
+      for (int x = 0; x < pad.fb_w; x++)
+         if (y < 40 || y >= 520 || x < 80 || x >= 720) fb[y * pad.pitch + x] = 0;
+   CHECK(cv_artifact_flags_for(fb, pad.pitch, 80, 40, 640, 480) == CV_ART_GREEN_DARK_BG, "flags: padded frame buffer");
+   free(fb);
+}
+
+// Lower case fix-up spread over frames (100 cells per frame): a half fixed
+// screen is never shown (Num Buffers >= 1), the finished one is right
+static void test_lowercase_spread(void) {
+   // font bit 0 (T1 shapes) left 0: see test_lowercase_32
+   static const uint8_t lower_on[9] = { 0x00, 0x01, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00 };
+   for (int k = 0; k < 2; k++) {                    // aligned and 2 pixels off
+      const gen_geom_t *g = &geoms[k];
+      for (int nb = 0; nb < 4; nb += 3) {
+         for (int i = 0; i < 4; i++) sim_buffers[i] = alloc_fb(g);
+         uint8_t *before = alloc_fb(g);
+         sim_t m = { nb, 0, 0, 0 };
+         cv_state_t s; cv_init(&s);
+         uint8_t text[512];
+         make_text_page(text, NULL);
+         sim_capture(&m, &s, g, GEN_TEXT, text, 0, NULL);
+         make_text_page(text, lower_on);
+         sim_capture(&m, &s, g, GEN_TEXT, text, 0, NULL);
+         make_text_page(text, NULL);
+         for (int i = 0; i < 4; i++) sim_capture(&m, &s, g, GEN_TEXT, text, 0, NULL);
+         memcpy(before, sim_buffers[m.displayed], (size_t)g->pitch * g->fb_h);
+         s.max_chars = 100;
+         for (int i = 0; i < 512; i++) text[i] = (uint8_t) (i & 31);   // all lower case
+         int frames = 0, bad = 0;
+         int start = m.displayed;
+         (void) start;
+         for (;;) {
+            sim_capture(&m, &s, g, GEN_TEXT, text, 0, NULL);
+            frames++;
+            if (s.lc_buf < 0 || frames > 20) break;
+            if (nb > 0 && memcmp(sim_buffers[m.displayed], before, (size_t)g->pitch * g->fb_h) != 0) bad++;
+         }
+         CHECK(frames >= 5 && frames <= 6, "lower spread geom %d nb %d: shown after %d frames", k, nb, frames);
+         CHECK(bad == 0, "lower spread geom %d nb %d: %d frames showed a half fixed screen", k, nb, bad);
+         int wrong = 0;
+         for (int i = 0; i < 512; i++)
+            wrong += cell_matches(sim_buffers[m.displayed], g, i & 31, i >> 5, cv_lower_glyph(i & 31, 0), CV_DKGREEN, CV_GREEN) != 0;
+         CHECK(wrong == 0, "lower spread geom %d nb %d: %d cells wrong", k, nb, wrong);
+         for (int i = 0; i < 4; i++) free(sim_buffers[i]);
+         free(before);
+      }
+   }
+}
+
+// ---------------------------------------------------------------------
 // Benchmark (the one the firmware runs from the Info menu): every row must
 // take the path it is meant to measure. PC timings are only a sanity check.
 // ---------------------------------------------------------------------
@@ -626,9 +1105,19 @@ int main(void) {
    test_cg2_decode();
    test_end_to_end();
    test_entry_holds();
+   test_lowercase_32();
+   test_lowercase_font_select();
+   test_lowercase_forced();
+   test_lowercase_fast();
+   test_lowercase_dot_errors();
+   test_ef_tiebreak();
+   test_lowercase_spread();
+   test_artifacts();
+   test_artifact_flags();
    test_budget();
    test_sliced_decode();
    make_previews();
+   make_artifact_preview();
    test_bench();
    printf("%d checks, %d failures\n", checks, failures);
    return failures ? 1 : 0;

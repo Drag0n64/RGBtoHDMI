@@ -2767,7 +2767,8 @@ void swapBuffer(int buffer) {
 // by rgb_to_fb.S) and the frame is not flipped; the 64x32 text screen is
 // maintained in the buffer that is on screen.
 // ---------------------------------------------------------------------
-int cocovga_redirect = 0;
+int cocovga_redirect = 0;   // 0 = normal, else capture next frame into buffer (value - 1)
+int cocovga_noflip = 0;     // 1 = don't flip the frame just captured to the screen
 static cv_state_t cocovga_state;
 static int cocovga_initialised = 0;
 
@@ -2985,7 +2986,13 @@ void cocovga_info_bench(int line) {
     osd_set(line++, 0, "! = path not taken (please report)");
 }
 
+extern uint32_t mc6847_artifact_table[256];
+extern int mc6847_artifact_enable;
+static void mc6847_artifact_frame(int captured);
 void cocovga_frame_hook(int captured, unsigned int flags) {
+    if (!(flags & (BIT_PROBE | BIT_INTERLACED_VIDEO))) {
+        mc6847_artifact_frame(captured);
+    }
     if (!cocovga_initialised) {
         cv_init(&cocovga_state);
         // drawing work per frame is limited so the hook ends before the
@@ -2995,6 +3002,16 @@ void cocovga_frame_hook(int captured, unsigned int flags) {
         cocovga_state.decode_budget_us = CV_DECODE_BUDGET_US;
         cocovga_initialised = 1;
     }
+    // 32 column lower case, read fresh so a menu change applies to the very
+    // next frame: Auto = the CoCoVGA register page turns it on/off, Off =
+    // never (plain 6847 inverse), CoCoVGA / Dragon 200-E = always on with that
+    // lower case font, no register page needed
+    static const signed char lc_on[]   = { -1, 0, 1, 1 };
+    static const signed char lc_font[] = { CV_LC_COCOVGA, CV_LC_COCOVGA, CV_LC_COCOVGA, CV_LC_DRAGON200E };
+    int lc = parameters[F_COCOVGA_LC_FONT];
+    if (lc < 0 || lc > 3) lc = 0;
+    cocovga_state.lc_on_mode = lc_on[lc];
+    cocovga_state.lc_font = lc_font[lc];
     int enabled = parameters[F_COCOVGA]
                && parameters[F_PALETTE_CONTROL] == PALETTECONTROL_C64_LUMACODE
                && capinfo->bpp == 8
@@ -3012,19 +3029,53 @@ void cocovga_frame_hook(int captured, unsigned int flags) {
         if (osd_active()) cv_live.off_osd++;
         cv_stop(&cocovga_state);
         cocovga_redirect = 0;
+        cocovga_noflip = 0;
         cv_live_last_valid = 0;
         memset(cv_live_recent, 0, sizeof(cv_live_recent));
         return;
     }
-    int redirect, swap_to;
+    int capture_next, inhibit_flip, swap_to;
     unsigned int t0 = cv_usec();
     cv_frame_t f = cv_frame(&cocovga_state, captured, current_display_buffer, NBUFFERS, cocovga_buffer,
-             capinfo->pitch, capinfo->width, capinfo->height, &redirect, &swap_to);
-    cv_live_frame(t0, cv_usec(), (int) f);
+             capinfo->pitch, capinfo->width, capinfo->height, &capture_next, &inhibit_flip, &swap_to);
+    int kind = (int) f;
+    if (f == CV_FRAME_TEXT && cv_lowercase_on(&cocovga_state) && !cocovga_state.w64_on) kind = 4;   // 32 column lower case
+    cv_live_frame(t0, cv_usec(), kind);
     if (swap_to >= 0) {
         swapBuffer(swap_to);
     }
-    cocovga_redirect = redirect;
+    cocovga_redirect = capture_next + 1;
+    cocovga_noflip = inhibit_flip;
+}
+
+// MC6847 NTSC artifact colours (capture_line_mc6847_8bpp.S)
+
+static int mc6847_artifact_flags = 0;
+void mc6847_artifact_update() {
+    int mode = parameters[F_ARTIFACT6847];
+    cv_build_artifact_table(mc6847_artifact_table, mode, mc6847_artifact_flags);
+    mc6847_artifact_enable = mode != 0;
+}
+
+// Per frame: green colour set graphics (PMODE 4 "black" is dark green) use
+// a table that also pairs dark green with green; text keeps the plain one.
+// Artifact dots keep their colour codes, so a frame captured with the
+// other table only looks different, the CoCoVGA decoders are unaffected.
+static void mc6847_artifact_frame(int captured) {
+    if (!mc6847_artifact_enable || parameters[F_PALETTE_CONTROL] != PALETTECONTROL_C64_LUMACODE || capinfo->bpp != 8) {
+        return;
+    }
+    // where the capture sits in the frame buffer (see rgb_to_fb.S)
+    int w = capinfo->chars_per_line * 8;
+    int h = capinfo->nlines * ((capinfo->sizex2 & SIZEX2_DOUBLE_HEIGHT) ? 2 : 1);
+    if (capinfo->h_adjust + w > capinfo->pitch) w = capinfo->pitch - capinfo->h_adjust;
+    if (capinfo->v_adjust + h > capinfo->height) h = capinfo->height - capinfo->v_adjust;
+    int f = cv_artifact_flags_for((uint8_t *) capinfo->fb + captured * capinfo->height * capinfo->pitch,
+                                  capinfo->pitch, capinfo->h_adjust, capinfo->v_adjust, w, h);
+    if (f != mc6847_artifact_flags) {
+        mc6847_artifact_flags = f;
+        cv_build_artifact_table(mc6847_artifact_table, parameters[F_ARTIFACT6847], f);
+    }
 }
 
 int get_vsync_width_lines() {
@@ -3353,6 +3404,13 @@ void set_parameter(int parameter, int value) {
         case F_PALETTE:
         {
             parameters[parameter] = value;
+            osd_update_palette(0);
+        }
+        break;
+        case F_ARTIFACT6847:
+        {
+            parameters[parameter] = value;
+            mc6847_artifact_update();
             osd_update_palette(0);
         }
         break;

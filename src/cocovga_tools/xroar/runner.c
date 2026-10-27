@@ -188,7 +188,7 @@ int main(int argc, char **argv) {
 #endif
 #ifdef CV_HAVE_LOWERCASE_32
       if (art) {                       // as mc6847_artifact_frame() in rgb_to_hdmi.c
-         int f = cv_artifact_flags_for(buf[cap], W);
+         int f = cv_artifact_flags_for(buf[cap], W, 0, 0, W, H);
          if (f != art_flags) { art_flags = f; cv_build_artifact_table(table, art, art_flags); }
       }
 #endif
@@ -312,6 +312,22 @@ int main(int argc, char **argv) {
          }
 #endif
          for (int i = 0; i < FSZ; i++) bad += (scr[i] ^ expect[i]) & 15 ? 1 : 0;
+         // with a work limit the lower case fix-up may show a (complete)
+         // screen from a few frames back
+#define THIST 8
+         static uint8_t *thist[THIST];
+         static int thist_n = 0;
+         if (!thist[0]) for (int h = 0; h < THIST; h++) thist[h] = malloc(FSZ);
+         if (bad && (maxchars || decoderows)) {
+            for (int h = 0; h < THIST && h < thist_n && bad; h++) {
+               const uint8_t *e = thist[(thist_n - 1 - h) % THIST];
+               long b2 = 0;
+               for (int i = 0; i < FSZ && !b2; i++) b2 += (scr[i] ^ e[i]) & 15 ? 1 : 0;
+               if (!b2) bad = 0;
+            }
+         }
+         memcpy(thist[thist_n % THIST], expect, FSZ);
+         thist_n++;
          if (bad && prev_type == 2 && w64_was_on && !s.w64_on) {
             result(K_RIDE, fno, 0);       // first frame after leaving W64
          } else if (bad && s.w64_on && prev_type == 2) {

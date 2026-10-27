@@ -104,6 +104,20 @@ typedef struct {
    int decode_row;             // next CG2 pixel row (0-63) to decode
    int rows_valid;             // rows decoded since W64 (re)started, up to 64
 
+   // 32 column lower case, spread over frames like W64: a captured text
+   // screen is fixed up off screen (cell lc_pos onwards, within the work
+   // limit) and shown when complete
+   int lc_buf;                 // buffer being fixed up, -1 = none
+   int lc_pos;                 // next cell (0-511)
+   // which lower case glyphs replace an inverse cell: CV_LC_COCOVGA or
+   // CV_LC_DRAGON200E (the 6847T1's own shapes sit too high next to the
+   // 6847's capitals, so they are only used by W64 with T1 capitals)
+   int lc_font;
+   // whether inverse cells are replaced at all: -1 = follow regs.font bit 1
+   // (the CoCoVGA lower case bit), 0 = never (plain 6847 inverse), 1 = always
+   // (as a 6847T1 with lower case on - no register page write needed)
+   int lc_on_mode;
+
    // the last frame looked like a CG picture but could not be used to
    // enter W64: its top border still had the previous mode's colour (the
    // mode changed after the top border began, as on a PAL Dragon, where
@@ -126,10 +140,14 @@ typedef uint8_t *(*cv_buffer_fn)(int index);
 extern const uint8_t mc6847_font[64][12];
 extern const uint8_t mc6847t1_font[96][12];
 extern const uint8_t mc6847_rom_font[64][12];   // the 6847's own glyphs (for recognising cells)
-// lower case glyph for code $00-$1F: as in the MC6847T1 table when the
-// capitals are T1 ones (rows 1-7), else moved down 2 rows to the baseline of
-// the 6847's capitals (rows 3-9)
-const uint8_t *cv_lower_glyph(int code, int t1_capitals);
+extern const uint8_t dragon200e_lower_font[32][12];
+// lower case glyph for code $00-$1F, in one of these styles:
+#define CV_LC_COCOVGA     0   // MC6847T1 lower case moved down 2 rows to the
+                              // baseline of the 6847's capitals (rows 3-9)
+#define CV_LC_T1          1   // as in the MC6847T1 table, next to T1 capitals
+                              // (rows 1-7; W64 with the font register's T1 bit)
+#define CV_LC_DRAGON200E  2   // the Dragon 200-E's lower case ROM
+const uint8_t *cv_lower_glyph(int code, int style);
 
 void       cv_init(cv_state_t *s);
 void       cv_reset_registers(cv_state_t *s);
@@ -148,13 +166,56 @@ int        cv_render(cv_state_t *s, uint8_t *fb, int pitch, int full);
 //   nbuffers     : number of frame buffers available (4)
 //   buffer       : returns the address of a buffer
 // Outputs:
-//   *redirect    : 0 = normal capture/flip, else (capture buffer + 1) and
-//                  the frame must NOT be flipped to the screen
+//   *capture_next: -1 = normal buffer choice, else capture the next frame
+//                  into this buffer
+//   *inhibit_flip: 1 = do NOT flip the frame just captured to the screen
 //   *swap_to     : -1 = nothing, else make this buffer visible now
 // Returns the frame classification.
 cv_frame_t cv_frame(cv_state_t *s, int captured, int displayed, int nbuffers,
                     cv_buffer_fn buffer, int pitch, int width, int height,
-                    int *redirect, int *swap_to);
+                    int *capture_next, int *inhibit_flip, int *swap_to);
+
+// 32 column text: when the font register forces lower case, replace the
+// inverse characters $00-$1F of a captured text screen with lower case
+// (as CoCoVGA does). Returns the number of characters replaced.
+int        cv_lowercase_32(cv_state_t *s, uint8_t *fb, int pitch);
+// 32 column lower case in effect (lc_on_mode, else the font register's bit)
+int        cv_lowercase_on(const cv_state_t *s);
+// minimum number of dots in which two 6847 glyphs differ over the dots the
+// fast lower case path checks (for the test harness)
+int        cv_lowercase_min_distance(void);
+#define CV_HAVE_LOWERCASE_32 1
+
+// ---------------------------------------------------------------------
+// MC6847 NTSC artifact colours (used with capture_line_mc6847_8bpp.S)
+// ---------------------------------------------------------------------
+// An artifact dot keeps its own colour code in the low 4 bits (so the
+// CoCoVGA decoders, which only look at those, never see artifacts, whatever
+// the capture alignment) and gets an artifact tag in bits 4-6. The palette
+// shows every dot carrying a tag in that tag's artifact colour.
+#define CV_ART_CSS1_A 0x10    // buff/black pair, lit dot first
+#define CV_ART_CSS1_B 0x20    // buff/black pair, lit dot second
+#define CV_ART_CSS0_A 0x30    // green/black pair, lit dot first
+#define CV_ART_CSS0_B 0x40    // green/black pair, lit dot second
+
+// mode: 0 = off, 1 = red/blue, 2 = blue/red
+// flags: CV_ART_GREEN_DARK_BG - in the green colour set the "black" dots of
+// PMODE 4 are dark green (as XRoar draws them); only safe for graphics
+// frames, see cv_artifact_flags_for()
+// table[first | second << 4] = 32 bit frame buffer word for the dot pair
+// (4 pixels, double width, little endian)
+#define CV_ART_GREEN_DARK_BG 1
+void       cv_build_artifact_table(uint32_t *table, int mode, int flags);
+// flags for the next frame, from a captured frame: graphics in the green
+// colour set (green border at the top and the bottom of the capture) ->
+// CV_ART_GREEN_DARK_BG, else 0 (text keeps its dark green / green dots).
+// x0, y0, w, h: where the capture is in the frame buffer (pixels / lines)
+int        cv_artifact_flags_for(const uint8_t *fb, int pitch, int x0, int y0, int w, int h);
+// palette value (0xMMBBGGRR, MM = luma) for an artifact index, else -1
+int        cv_artifact_palette_entry(int index);
+// which colour a (first, second) dot pair produces with the given mode,
+// or -1 if the pair is not an artifact pair
+int        cv_artifact_index(int first, int second, int mode, int flags);
 
 // Leave W64 mode (e.g. when the OSD is opened or emulation switched off).
 // Returns 1 if the caller should resume normal flipping.

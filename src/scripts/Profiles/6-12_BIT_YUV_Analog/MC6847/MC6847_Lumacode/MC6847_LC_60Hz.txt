@@ -4,4 +4,5 @@ palette=MC6847_LC
 palette_control=7
 audio_capture=0
 audio_mode=1
+mc6847_artifact=1
 optimise=0
