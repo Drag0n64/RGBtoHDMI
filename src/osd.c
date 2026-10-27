@@ -490,6 +490,7 @@ static param_t features[] = {
    {    F_YUV_PIXEL_DOUBLE,  "YUV Pixel Double",  "yuv_pixel_double", 0,                    1, 1, 1 },
    {      F_INTEGER_ASPECT,"Integer Aspect Ratio",    "integer_aspect", 0, NUM_INTEGER_ASPECT-1, 1, 1 },
    {     F_INTEGER_SCALING,"16:9 Integer Scaling", "integer_scaling", 0, NUM_INTEGER_SCALING-1, 1, 1 },
+   {           F_COCOVGA,    "CoCoVGA 64 Col",           "cocovga", 0,                    1, 1, 1 },
 
    {         F_PROFILE_NUM,"Custom Profile Num",    "profile_number", 0,                  9, 1, 0 },
    {             F_H_WIDTH,       "Pixel Width",       "pixel_width", 120,               1920, 8, 0 },
@@ -595,6 +596,9 @@ static void info_cal_raw(int line);
 static void info_save_list(int line);
 static void info_save_log(int line);
 static void info_credits(int line);
+extern void cocovga_info_bench(int line);
+extern void cocovga_info_live(int line);
+extern int cocovga_info_request;
 static void info_reboot(int line);
 
 static void stop_playing_audio(int line);
@@ -628,6 +632,8 @@ static info_menu_item_t cal_raw_ref             = { I_INFO, "Calibration Raw",  
 static info_menu_item_t save_list_ref           = { I_INFO, "Save Profile List",    info_save_list};
 static info_menu_item_t save_log_ref            = { I_INFO, "Save Log & EDID",      info_save_log};
 static info_menu_item_t credits_ref             = { I_INFO, "Credits",              info_credits};
+static info_menu_item_t cocovga_bench_ref       = { I_INFO, "CoCoVGA Benchmark",    cocovga_info_bench};
+static info_menu_item_t cocovga_live_ref        = { I_INFO, "CoCoVGA Live Timing",  cocovga_info_live};
 static info_menu_item_t reboot_ref              = { I_INFO, "Reboot",               info_reboot};
 
 static info_menu_item_t analyse_timing_ref      = { I_INFO, "Analyse Timing",    analyse_timing};
@@ -778,6 +784,7 @@ static param_menu_item_t overscan_ref        = { I_FEATURE, &features[F_CROP_BOR
 static param_menu_item_t capscale_ref        = { I_FEATURE, &features[F_SCREENCAP_SIZE]   };
 static param_menu_item_t border_ref          = { I_FEATURE, &features[F_BORDER_COLOUR]    };
 static param_menu_item_t palettecontrol_ref  = { I_FEATURE, &features[F_PALETTE_CONTROL]  };
+static param_menu_item_t cocovga_ref         = { I_FEATURE, &features[F_COCOVGA]          };
 static param_menu_item_t ntsccolour_ref      = { I_FEATURE, &features[F_NTSC_COLOUR]      };
 static param_menu_item_t ntscphase_ref       = { I_FEATURE, &features[F_NTSC_PHASE]       };
 static param_menu_item_t ntsctype_ref        = { I_FEATURE, &features[F_NTSC_TYPE]        };
@@ -905,6 +912,8 @@ static menu_t info_menu = {
       (base_menu_item_t *) &back_ref,
       (base_menu_item_t *) &source_summary_ref,
       (base_menu_item_t *) &system_summary_ref,
+      (base_menu_item_t *) &cocovga_live_ref,
+      (base_menu_item_t *) &cocovga_bench_ref,
       (base_menu_item_t *) &cal_summary_ref,
       (base_menu_item_t *) &cal_detail_ref,
       (base_menu_item_t *) &cal_raw_ref,
@@ -944,6 +953,7 @@ static menu_t palette_menu = {
       (base_menu_item_t *) &sat_ref,
       (base_menu_item_t *) &tint_ref,
       (base_menu_item_t *) &palettecontrol_ref,
+      (base_menu_item_t *) &cocovga_ref,
       (base_menu_item_t *) &ntsccolour_ref,
       (base_menu_item_t *) &ntscphase_ref,
       (base_menu_item_t *) &ntsctype_ref,
@@ -7194,6 +7204,7 @@ int osd_key(int key) {
 
          case I_INFO:
             osd_state = INFO;
+            cocovga_info_request = 1;
             osd_clear_no_palette();
             redraw_menu();
             break;
@@ -8389,6 +8400,11 @@ void osd_init() {
 
    // pre-read default profile
    unsigned int bytes = file_read_profile(ROOT_DEFAULT_STRING, 0, NULL, 0, default_buffer, MAX_BUFFER_SIZE - 4);
+   if (bytes != 0 && strstr(default_buffer, "cocovga=") == NULL && strlen(default_buffer) + 16 < MAX_BUFFER_SIZE - 4) {
+      // older Default.txt files don't have the CoCoVGA setting: default it to
+      // off so it doesn't carry over from the MC6847 profile to others
+      strcat(default_buffer, "\r\ncocovga=0\r\n");
+   }
    if (bytes != 0) {
       size_t count = 0;
       size_t mcount = 0;

@@ -118,6 +118,14 @@ file( GLOB core_files
     saa5050_font.c
     8x8_font.h
     8x8_font.c
+    # CoCoVGA 64 column text emulation (MC6847 LumaCode)
+    cocovga.h
+    cocovga.c
+    cocovga_font.c
+    cocovga_bench.h
+    cocovga_bench.c
+    cocovga_tools/gen6847.h
+    cocovga_tools/gen6847.c
     # File system functions
     filesystem.c
     filesystem.h

@@ -402,20 +402,11 @@ no_refresh:
         // else draw to the "spare" buffer
         mov    r0, #0
 #ifdef MULTI_BUFFER
-        tst    r3, #(BIT_INTERLACED_VIDEO | BIT_PROBE)
-        bne    buffer_chosen
         // Draw to the buffers cyclically, i.e. pick the one
         // after the last completed buffer, modulo <nbuffers + 1>
+        // (or the buffer the CoCoVGA emulation asks for)
         // r8 and r9 are free at this point
-        mov    r8, r3, lsr #OFFSET_LAST_BUFFER
-        and    r8, r8, #3
-        mov    r9, r3, lsr #OFFSET_NBUFFERS
-        and    r9, r9, #3
-        cmp    r8, r9
-        beq    buffer_chosen
-        add    r0, r8, #1
-        and    r0, r0, #3
-buffer_chosen:
+        bl     select_capture_buffer
 #endif
         ldr    r8, =param_framebuffer0
         ldr    r11, [r8, r0, lsl #2]
@@ -1320,6 +1311,7 @@ force_osd_update:
         pop    {r1-r5, r11}
 skip_osd_update:
         bic    r3, r3, #BIT_CLEAR
+        bl     cocovga_frame_asm        // CoCoVGA 64 column text emulation
 
 #ifdef MULTI_BUFFER
         // Update the last drawn buffer
@@ -1330,7 +1322,8 @@ skip_osd_update:
         // Flip to it on next V SYNC
 
         // Skip the multi buffering in mode 7 and probe mode
-        tst    r3, #(BIT_INTERLACED_VIDEO | BIT_PROBE)
+        // and while the CoCoVGA emulation keeps its picture on screen
+        bl     flip_inhibited
         bne    noflip
         // Flip to the last completed draw buffer
         // It seems the GPU delays this until the next vsync
@@ -3828,3 +3821,54 @@ line_buffer:
         .align 6
 dummyscreen:               // used by capture preload
         .space 1920*1080, 0
+
+// ---------------------------------------------------------------------
+// Buffer selection helpers, kept out of line so the capture loop above
+// doesn't grow (its pc relative loads are at the limit of their range).
+// The CoCoVGA 64 column text emulation (cocovga_frame_hook in
+// rgb_to_hdmi.c) sets cocovga_redirect = capture buffer + 1 while it keeps
+// its own picture on screen.
+// ---------------------------------------------------------------------
+        .align 2
+#ifdef MULTI_BUFFER
+// in: r3 = flags; out: r0 = buffer to capture into; corrupts r8, r9
+select_capture_buffer:
+        mov    r0, #0
+        tst    r3, #(BIT_INTERLACED_VIDEO | BIT_PROBE)
+        movne  pc, lr
+        ldr    r8, =cocovga_redirect
+        ldr    r8, [r8]
+        subs   r0, r8, #1
+        movpl  pc, lr
+        mov    r0, #0
+        mov    r8, r3, lsr #OFFSET_LAST_BUFFER
+        and    r8, r8, #3
+        mov    r9, r3, lsr #OFFSET_NBUFFERS
+        and    r9, r9, #3
+        cmp    r8, r9
+        addne  r0, r8, #1
+        andne  r0, r0, #3
+        mov    pc, lr
+
+// in: r3 = flags; out: Z clear if the frame must not be flipped to the screen
+flip_inhibited:
+        tst    r3, #(BIT_INTERLACED_VIDEO | BIT_PROBE)
+        movne  pc, lr
+        push   {r0}
+        ldr    r0, =cocovga_redirect
+        ldr    r0, [r0]
+        cmp    r0, #0
+        pop    {r0}
+        mov    pc, lr
+#endif
+
+// calls cocovga_frame_hook(current buffer, flags), preserves all registers
+cocovga_frame_asm:
+        push   {r0-r12, lr}
+        mov    r0, r3, lsr #OFFSET_CURR_BUFFER
+        and    r0, r0, #3
+        mov    r1, r3
+        bl     cocovga_frame_hook
+        pop    {r0-r12, pc}
+
+        .ltorg

@@ -31,6 +31,9 @@
 #include "gitversion.h"
 #include "vid_cga_comp.h"
 #include "audio/start.h"
+#include "cocovga.h"
+#include "cocovga_bench.h"
+#include "rpi-systimer.h"
 // #define INSTRUMENT_CAL
 #define NUM_CAL_PASSES 1
 
@@ -2755,6 +2758,275 @@ void swapBuffer(int buffer) {
 }
 #endif
 
+// ---------------------------------------------------------------------
+// CoCoVGA 64 column text emulation (MC6847 LumaCode, see cocovga.c)
+//
+// Called from rgb_to_fb.S after every captured frame, before the frame is
+// flipped to the screen. While 64 column text is shown, the capture is
+// redirected to a buffer that isn't on screen (cocovga_redirect != 0, read
+// by rgb_to_fb.S) and the frame is not flipped; the 64x32 text screen is
+// maintained in the buffer that is on screen.
+// ---------------------------------------------------------------------
+int cocovga_redirect = 0;
+static cv_state_t cocovga_state;
+static int cocovga_initialised = 0;
+
+static uint8_t *cocovga_buffer(int index) {
+    return (uint8_t *) capinfo->fb + index * capinfo->height * capinfo->pitch;
+}
+
+// Called after the screen has been cleared (mode change)
+void cocovga_screen_cleared(void) {
+    if (cocovga_initialised) {
+        cv_invalidate(&cocovga_state);
+    }
+}
+
+// Called when the Dragon's sync changed (e.g. it was power cycled): its
+// CoCoVGA register state is unknown, so start from the defaults
+void cocovga_sync_changed(void) {
+    if (cocovga_initialised) {
+        cv_reset_registers(&cocovga_state);
+    }
+}
+
+// ---------------------------------------------------------------------
+// CoCoVGA timing statistics (Info menu: "CoCoVGA Live Timing")
+// The hook runs between the end of one capture and the next vsync; if it
+// runs past that vsync a frame is dropped. Each frame's hook time is
+// measured with the 1 MHz system timer, and the interval between hook calls
+// shows dropped frames.
+// ---------------------------------------------------------------------
+#define CV_LIVE_KINDS 5
+static const char *cv_live_names[CV_LIVE_KINDS] = { "Other", "Text 32", "Register", "W64 (CG2)", "Lower 32" };
+typedef struct {
+    unsigned int n, max;
+    unsigned long long sum;
+} cv_tstat_t;
+typedef struct {
+    cv_tstat_t kind[CV_LIVE_KINDS];
+    unsigned int frames, dropped, min_period;
+    unsigned int reinit_timing, reinit_state, reinit_hook_max;
+    // hook calls, and why it did not run (since the last view)
+    unsigned int calls, off_setting, off_palette, off_bpp, off_mode7, off_probe, off_interlaced, off_osd;
+} cv_live_t;
+static cv_live_t cv_live, cv_live_shown;
+static unsigned int cv_live_last_entry;
+static int cv_live_last_valid = 0;
+static unsigned int cv_live_recent[4];
+static int cv_live_recent_pos = 0;
+int cocovga_info_request = 0;    // set by osd.c when an Info page is opened
+// time per frame for the CoCoVGA work (decoding + drawing); drawing stops
+// when it is used up and continues in the next frame (Live Timing shows
+// whether frames are still dropped)
+#define CV_HOOK_BUDGET_US 250
+// part of it for reading the CG2 picture back (rows not read in this frame
+// are read in the next ones)
+#define CV_DECODE_BUDGET_US 120
+
+static unsigned int cv_usec(void) {
+    return RPI_GetSystemTimer()->counter_lo;
+}
+
+static void cv_live_frame(unsigned int t0, unsigned int t1, int kind) {
+    if (cv_live_last_valid) {
+        unsigned int period = t0 - cv_live_last_entry;
+        if (cv_live.min_period == 0 || period < cv_live.min_period) {
+            cv_live.min_period = period;
+        }
+        if (period > cv_live.min_period * 3 / 2 && period < cv_live.min_period * 10) {
+            cv_live.dropped++;
+        }
+    }
+    cv_live_last_entry = t0;
+    cv_live_last_valid = 1;
+    unsigned int dt = t1 - t0;
+    cv_tstat_t *k = &cv_live.kind[kind];
+    k->n++;
+    k->sum += dt;
+    if (dt > k->max) k->max = dt;
+    cv_live.frames++;
+    cv_live_recent[cv_live_recent_pos++ & 3] = dt;
+}
+
+// called by the main loop when it re-initialises after a mode change
+static void cocovga_reinit(int result) {
+    if (result & RET_SYNC_TIMING_CHANGED) cv_live.reinit_timing++;
+    if (result & RET_SYNC_STATE_CHANGED) cv_live.reinit_state++;
+    if (result & (RET_SYNC_TIMING_CHANGED | RET_SYNC_STATE_CHANGED)) {
+        // only sync / timing changes can be caused by a slow hook (not
+        // profile or menu changes)
+        unsigned int m = 0;
+        for (int i = 0; i < 4; i++) if (cv_live_recent[i] > m) m = cv_live_recent[i];
+        if (m > cv_live.reinit_hook_max) cv_live.reinit_hook_max = m;
+    }
+    memset(cv_live_recent, 0, sizeof(cv_live_recent));
+    cv_live_last_valid = 0;
+}
+
+// time left between the end of the capture and the next vsync (estimate)
+static int cv_budget_lines(int *lines, int *width, int *capture_end) {
+    *lines = lines_per_vsync;
+    *width = vsync_width_lines;
+    int n = capinfo->nlines;
+    if (n + capinfo->v_offset > *lines) n >>= 1;     // line doubled
+    *capture_end = capinfo->v_offset + n;
+    if (*lines <= 0) return -1;
+    return *lines - *width - *capture_end;
+}
+
+static int cv_budget_line(int line) {
+    char m[64];
+    int lines, width, end;
+    int b = cv_budget_lines(&lines, &width, &end);
+    if (!sync_detected || b < 0 || one_line_time_ns <= 0) {   // without sync the numbers are stale
+        osd_set(line++, 0, "Budget: needs the Dragon's sync");
+        return line;
+    }
+    sprintf(m, "Budget: %d lines = %d us (estimate)", b, b * one_line_time_ns / 1000);
+    osd_set(line++, 0, m);
+    sprintf(m, " frame %d, vsync %d, capture ends %d", lines, width, end);
+    osd_set(line++, 0, m);
+    return line;
+}
+
+// one line saying why the 64 column emulation can't run at the moment, or
+// nothing when it can
+static int cv_status_line(int line) {
+    char m[64];
+    if (!parameters[F_COCOVGA]) {
+        osd_set(line++, 0, "CoCoVGA 64 Col is off (Palette menu)");
+    } else if (parameters[F_PALETTE_CONTROL] != PALETTECONTROL_C64_LUMACODE) {
+        osd_set(line++, 0, "CoCoVGA off: Palette Control not Lumacode");
+    } else if (capinfo->bpp != 8) {
+        sprintf(m, "CoCoVGA OFF: frame buffer is %d bpp, needs 8", capinfo->bpp);
+        osd_set(line++, 0, m);
+        if (capinfo->bpp == 16) osd_set(line++, 0, " (HDMI Audio: set Optimise Profile Off)");
+    }
+    return line;
+}
+
+void cocovga_info_live(int line) {
+    char m[64];
+    if (cocovga_info_request) {
+        cocovga_info_request = 0;
+        cv_live_shown = cv_live;                 // show since last view, then start again
+        unsigned int t = cv_live.reinit_timing, s = cv_live.reinit_state, h = cv_live.reinit_hook_max;
+        memset(&cv_live, 0, sizeof(cv_live));
+        cv_live.reinit_timing = t;
+        cv_live.reinit_state = s;
+        cv_live.reinit_hook_max = h;
+    }
+    cv_live_t *v = &cv_live_shown;
+    line = cv_status_line(line);
+    osd_set(line++, 0, "Since last view, menu closed:");
+    unsigned int hz10 = v->min_period ? 10000000u / v->min_period : 0;
+    sprintf(m, "Frames %u  dropped %u  %u.%u Hz", v->frames, v->dropped, hz10 / 10, hz10 % 10);
+    osd_set(line++, 0, m);
+    line++;
+    osd_set(line++, 0, "Hook       frames   avg us   max us");
+    for (int i = 0; i < CV_LIVE_KINDS; i++) {
+        cv_tstat_t *k = &v->kind[i];
+        if (k->n == 0) continue;
+        sprintf(m, "%-10s %6u %8u %8u", cv_live_names[i], k->n, (unsigned int) (k->sum / k->n), k->max);
+        osd_set(line++, 0, m);
+    }
+    line++;
+    sprintf(m, "Hook calls %u, not run because of:", v->calls);
+    osd_set(line++, 0, m);
+    sprintf(m, " setting %u palette %u bpp %u mode7 %u", v->off_setting, v->off_palette, v->off_bpp, v->off_mode7);
+    osd_set(line++, 0, m);
+    sprintf(m, " probe %u interlaced %u menu %u", v->off_probe, v->off_interlaced, v->off_osd);
+    osd_set(line++, 0, m);
+    sprintf(m, "Re-inits since boot: timing %u, sync %u", v->reinit_timing, v->reinit_state);
+    osd_set(line++, 0, m);
+    sprintf(m, "Max hook time just before: %u us", v->reinit_hook_max);
+    osd_set(line++, 0, m);
+    line++;
+    cv_budget_line(line);
+}
+
+// CoCoVGA benchmark (Info menu: "CoCoVGA Benchmark"): needs no Dragon.
+// Uses uncached RAM below the sound / WAV buffers, the same memory type as the
+// frame buffers, so the screen is not disturbed.
+#define CV_BENCH_MEM ((uint8_t *) (UNCACHED_MEM_BASE + 0x400000))
+static cv_bench_result_t cv_bench;
+static int cv_bench_valid = 0;
+
+void cocovga_info_bench(int line) {
+    char m[64];
+    if (cocovga_info_request || !cv_bench_valid) {
+        cocovga_info_request = 0;
+        cv_bench_run(CV_BENCH_MEM, cv_usec, CV_HOOK_BUDGET_US, CV_DECODE_BUDGET_US, &cv_bench);
+        cv_bench_valid = 1;
+    }
+    line = cv_status_line(line);
+    osd_set(line++, 0, "Hook time per frame (us), with limits");
+    osd_set(line++, 0, "Lower case off:      min   avg   max");
+    int group = 0;
+    for (int i = 0; i < cv_bench.rows; i++) {
+        cv_bench_row_t *r = &cv_bench.row[i];
+        if (r->group != group) {
+            group = r->group;
+            osd_set(line++, 0, "Lower case on:");
+        }
+        sprintf(m, "%-19s%6u%6u%6u%s", r->name, r->min_us, r->avg_us, r->max_us, r->ok ? "" : " !");
+        osd_set(line++, 0, m);
+        if (r->frames > 1) {
+            sprintf(m, "  (shown after %d frames)", r->frames);
+            osd_set(line++, 0, m);
+        }
+    }
+    if (!cv_bench.lowercase_available) {
+        osd_set(line++, 0, "Lower case on: not in this build");
+    }
+    line++;
+    line = cv_budget_line(line);
+    osd_set(line++, 0, "! = path not taken (please report)");
+}
+
+void cocovga_frame_hook(int captured, unsigned int flags) {
+    if (!cocovga_initialised) {
+        cv_init(&cocovga_state);
+        // drawing work per frame is limited so the hook ends before the
+        // next vsync; the rest is carried to the next frame
+        cocovga_state.usec = cv_usec;
+        cocovga_state.budget_us = CV_HOOK_BUDGET_US;
+        cocovga_state.decode_budget_us = CV_DECODE_BUDGET_US;
+        cocovga_initialised = 1;
+    }
+    int enabled = parameters[F_COCOVGA]
+               && parameters[F_PALETTE_CONTROL] == PALETTECONTROL_C64_LUMACODE
+               && capinfo->bpp == 8
+               && !capinfo->mode7
+               && !(flags & (BIT_PROBE | BIT_INTERLACED_VIDEO))
+               && !osd_active();
+    cv_live.calls++;
+    if (!enabled) {
+        if (!parameters[F_COCOVGA]) cv_live.off_setting++;
+        if (parameters[F_PALETTE_CONTROL] != PALETTECONTROL_C64_LUMACODE) cv_live.off_palette++;
+        if (capinfo->bpp != 8) cv_live.off_bpp++;
+        if (capinfo->mode7) cv_live.off_mode7++;
+        if (flags & BIT_PROBE) cv_live.off_probe++;
+        if (flags & BIT_INTERLACED_VIDEO) cv_live.off_interlaced++;
+        if (osd_active()) cv_live.off_osd++;
+        cv_stop(&cocovga_state);
+        cocovga_redirect = 0;
+        cv_live_last_valid = 0;
+        memset(cv_live_recent, 0, sizeof(cv_live_recent));
+        return;
+    }
+    int redirect, swap_to;
+    unsigned int t0 = cv_usec();
+    cv_frame_t f = cv_frame(&cocovga_state, captured, current_display_buffer, NBUFFERS, cocovga_buffer,
+             capinfo->pitch, capinfo->width, capinfo->height, &redirect, &swap_to);
+    cv_live_frame(t0, cv_usec(), (int) f);
+    if (swap_to >= 0) {
+        swapBuffer(swap_to);
+    }
+    cocovga_redirect = redirect;
+}
+
 int get_vsync_width_lines() {
     return vsync_width_lines;
 }
@@ -3854,6 +4126,11 @@ void rgb_to_hdmi_main() {
       log_info("Mode changed=%d, ret=%x, fb_size_changed=%d, restart_profile=%d, HsyncT=%d", mode_changed, (result & (RET_SYNC_TIMING_CHANGED | RET_SYNC_STATE_CHANGED)), fb_size_changed, restart_profile, hsync_threshold);
       osd_clear();
       clear_full_screen();
+      cocovga_screen_cleared();
+      cocovga_reinit(result);
+      if (result & RET_SYNC_STATE_CHANGED) {
+         cocovga_sync_changed();
+      }
    }
 }
 
