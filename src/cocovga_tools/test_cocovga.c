@@ -622,13 +622,13 @@ static void test_lowercase_font_select(void) {
    uint8_t text[512];
    for (int i = 0; i < 512; i++) text[i] = (uint8_t) (i & 31);   // every cell inverse $00-$1F
    cv_state_t s; cv_init(&s);
-   CHECK(s.lc_font == CV_LC_COCOVGA, "lower case font defaults to CoCoVGA");
+   CHECK(s.lc_font == CV_LC_6847T1, "lower case font defaults to 6847T1");
    gen_frame(orig, g, GEN_TEXT, text, 0, 0);
    CHECK(cv_analyze(&s, orig, g->pitch, g->fb_w, g->fb_h) == CV_FRAME_TEXT, "font select: calibrate");
 
    static const struct { int font_t1_bit, lc_font; const char *label; } cases[] = {
-      { 0, CV_LC_COCOVGA,    "CoCoVGA, register plain" },
-      { 1, CV_LC_COCOVGA,    "CoCoVGA, register T1" },
+      { 0, CV_LC_6847T1,    "6847T1, register plain" },
+      { 1, CV_LC_6847T1,    "6847T1, register T1" },
       { 0, CV_LC_DRAGON200E, "Dragon 200-E, register plain" },
       { 1, CV_LC_DRAGON200E, "Dragon 200-E, register T1" },
    };
@@ -651,8 +651,42 @@ static void test_lowercase_font_select(void) {
    CHECK(dragon200e_lower_font[1][9] != 0 && dragon200e_lower_font[1][10] == 0, "200-E 'a' sits on row 9");
    CHECK(dragon200e_lower_font[7][10] != 0, "200-E 'g' descends below row 9");
    int differ = 0;
-   for (int c = 1; c <= 26; c++) differ += memcmp(cv_lower_glyph(c, CV_LC_COCOVGA), cv_lower_glyph(c, CV_LC_DRAGON200E), 12) != 0;
-   CHECK(differ > 0, "200-E and CoCoVGA lower case differ");
+   for (int c = 1; c <= 26; c++) differ += memcmp(cv_lower_glyph(c, CV_LC_6847T1), cv_lower_glyph(c, CV_LC_DRAGON200E), 12) != 0;
+   CHECK(differ > 0, "200-E and 6847T1 lower case differ");
+   free(fb); free(orig);
+}
+
+// Plain 6847s differ in 'E' and 'F' (3 or 4 dot middle bar, row 6): both
+// forms must turn into 'e' / 'f', on the fast and the general path, and a
+// 4 dot bar must not make any other cell change.
+static void test_lowercase_ef_forms(void) {
+   const gen_geom_t *g = &geoms[0];
+   uint8_t *fb = alloc_fb(g), *orig = alloc_fb(g);
+   uint8_t text[512];
+   for (int i = 0; i < 512; i++) text[i] = (uint8_t) (i & 31);   // every cell inverse $00-$1F
+   cv_state_t s; cv_init(&s);
+   gen_frame(orig, g, GEN_TEXT, text, 0, 0);
+   CHECK(cv_analyze(&s, orig, g->pitch, g->fb_w, g->fb_h) == CV_FRAME_TEXT, "ef forms: calibrate");
+   CHECK(mc6847_rom_font[5][6] == 0x38 && mc6847_rom_font[6][6] == 0x38, "ef forms: table has the 3 dot bar");
+   // make every E and F the 4 dot form: the dot at row 6, column 5 lit
+   for (int i = 0; i < 512; i++) {
+      if ((i & 31) != 5 && (i & 31) != 6) continue;
+      int cx = i & 31, cy = i >> 5;
+      for (int yy = 0; yy < g->vs; yy++)
+         for (int xx = 0; xx < g->hs; xx++)
+            orig[(g->oy + (cy * 12 + 6) * g->vs + yy) * g->pitch + g->ox + (cx * 8 + 5) * g->hs + xx] = CV_GREEN;
+   }
+   s.regs.font = 0x02;
+   for (int fast = 0; fast < 2; fast++) {
+      memcpy(fb, orig, (size_t)g->pitch * g->fb_h);
+      cv_lowercase_fast = fast;
+      cv_lowercase_32(&s, fb, g->pitch);
+      cv_lowercase_fast = 1;
+      int bad = 0;
+      for (int i = 0; i < 512; i++)
+         bad += cell_matches(fb, g, i & 31, i >> 5, cv_lower_glyph(i & 31, CV_LC_6847T1), CV_DKGREEN, CV_GREEN) != 0;
+      CHECK(bad == 0, "ef forms (%s path): %d cells wrong with a 4 dot E / F bar", fast ? "fast" : "general", bad);
+   }
    free(fb); free(orig);
 }
 
@@ -663,11 +697,11 @@ static void test_lowercase_font_select(void) {
 static void test_lowercase_forced(void) {
    static const uint8_t lower_on[9] = { 0x00, 0x01, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00 };
    static const struct { int write_regs, on_mode, font, expect_lower; const char *label; } cases[] = {
-      { 0, -1, CV_LC_COCOVGA,    0, "auto, no register page" },
-      { 1, -1, CV_LC_COCOVGA,    1, "auto, register page lower case" },
-      { 0,  1, CV_LC_COCOVGA,    1, "forced CoCoVGA, no register page" },
+      { 0, -1, CV_LC_6847T1,    0, "auto, no register page" },
+      { 1, -1, CV_LC_6847T1,    1, "auto, register page lower case" },
+      { 0,  1, CV_LC_6847T1,    1, "forced 6847T1, no register page" },
       { 0,  1, CV_LC_DRAGON200E, 1, "forced Dragon 200-E, no register page" },
-      { 1,  0, CV_LC_COCOVGA,    0, "forced off, register page lower case" },
+      { 1,  0, CV_LC_6847T1,    0, "forced off, register page lower case" },
    };
    for (int k = 0; k < 2; k++) {
       const gen_geom_t *g = &geoms[k];
@@ -1107,6 +1141,7 @@ int main(void) {
    test_entry_holds();
    test_lowercase_32();
    test_lowercase_font_select();
+   test_lowercase_ef_forms();
    test_lowercase_forced();
    test_lowercase_fast();
    test_lowercase_dot_errors();

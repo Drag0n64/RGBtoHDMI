@@ -23,8 +23,6 @@ limit (128 characters / 8 CG2 rows per frame).
     `-ui null`, render video for real (e.g. `-ccr simulated` NTSC) and save
     PNG screenshots of those frames (used for the artifact colours).
   * `rom.c`: two more Dragon BASIC ROM CRCs, so `-type` works with them.
-  * `font-6847.c`: 'E' and 'F' with a 3 dot middle bar, as a real MC6847
-    draws them (XRoar has 4 dots; see COCOVGA.md).
 * `mkrom.py` - a 16 KB test ROM (no Microsoft code) that drives the
   6847 like NitrOS-9's CoVGA driver: BASIC-like screen, register page for
   one frame, CG2 64x32 text with typing and scrolling, back to 32 columns,

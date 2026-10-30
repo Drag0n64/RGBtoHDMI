@@ -75,7 +75,7 @@ void cv_init(cv_state_t *s) {
    s->build_buf = -1;
    s->full_pos = -1;
    s->lc_buf = -1;
-   s->lc_font = CV_LC_COCOVGA;
+   s->lc_font = CV_LC_6847T1;
    s->lc_on_mode = -1;
    cv_leave_count = 0;
 }
@@ -157,6 +157,37 @@ static int popcount8(unsigned int v) {
 
 // fb / pitch / ox / oy / hs / vs describe where the cell's picture is (the
 // register page passes a copy of its top 12 dot lines, vs = 1)
+// Plain MC6847 chips do not all draw the same glyphs: 'E' and 'F' have a 3
+// dot middle bar on some (a real Dragon 32/64) and 4 dots on others (the
+// Acorn Atom's, as captured in MAME and XRoar), and '3' a 2 or 1 dot middle
+// stroke. Only row 6 differs; both forms of each are recognised.
+// mc6847_rom_font holds one form, rom_alt_row6() the other (-1 = none).
+static int rom_alt_row6(int code) {
+   if (code == 0x05 || code == 0x06) return 0x3C;   // E, F: 4 dot bar
+   if (code == 0x33) return 0x04;                   // 3: 1 dot stroke
+   return -1;
+}
+
+static int rom_glyph_is(const uint8_t *rows, int code) {
+   const uint8_t *g = mc6847_rom_font[code];
+   if (memcmp(rows, g, 12) == 0) return 1;
+   int alt = rom_alt_row6(code);
+   return alt >= 0 && rows[6] == alt && memcmp(rows, g, 6) == 0 && memcmp(rows + 7, g + 7, 5) == 0;
+}
+
+// dots in which rows differ from the nearer form of a glyph
+static int rom_glyph_distance(const uint8_t *rows, int code) {
+   const uint8_t *g = mc6847_rom_font[code];
+   int d = 0;
+   for (int dy = 0; dy < 12; dy++) d += popcount8(rows[dy] ^ g[dy]);
+   int alt = rom_alt_row6(code);
+   if (alt >= 0) {
+      int d2 = d - popcount8(rows[6] ^ g[6]) + popcount8(rows[6] ^ alt);
+      if (d2 < d) d = d2;
+   }
+   return d;
+}
+
 static int decode_text_cell(const uint8_t *fb, int pitch, int ox, int oy, int hs, int vs, int col, int row) {
    int x0 = ox + col * 8 * hs;
    int y0 = oy + row * 12 * vs;
@@ -178,20 +209,17 @@ static int decode_text_cell(const uint8_t *fb, int pitch, int ox, int oy, int hs
    if ((seen & ~text0) == 0) {
       // exact match first (the 6847's output is digital), then tolerant
       for (int i = 0; i < 64; i++) {
-         if (memcmp(dark_bits, mc6847_rom_font[i], 12) == 0) return 0x40 | i;
+         if (rom_glyph_is(dark_bits, i)) return 0x40 | i;
       }
       uint8_t lit_bits[12];
       for (int dy = 0; dy < 12; dy++) lit_bits[dy] = (uint8_t) ~dark_bits[dy];
       for (int i = 0; i < 64; i++) {
-         if (memcmp(lit_bits, mc6847_rom_font[i], 12) == 0) return i;
+         if (rom_glyph_is(lit_bits, i)) return i;
       }
       int best = 99, best_code = -1;
       for (int i = 0; i < 64; i++) {
-         int dn = 0, di = 0;
-         for (int dy = 0; dy < 12; dy++) {
-            dn += popcount8(dark_bits[dy] ^ mc6847_rom_font[i][dy]);
-            di += popcount8((~dark_bits[dy] & 0xFF) ^ mc6847_rom_font[i][dy]);
-         }
+         int dn = rom_glyph_distance(dark_bits, i);
+         int di = rom_glyph_distance(lit_bits, i);
          if (dn < best) { best = dn; best_code = 0x40 | i; }
          if (di < best) { best = di; best_code = i; }
       }
@@ -397,7 +425,7 @@ const uint8_t *cv_lower_glyph(int code, int style) {
       }
       ready = 1;
    }
-   if (style == CV_LC_T1) return mc6847t1_font[64 + (code & 31)];
+   if (style == CV_LC_T1_HIGH) return mc6847t1_font[64 + (code & 31)];
    if (style == CV_LC_DRAGON200E) return dragon200e_lower_font[code & 31];
    return low[code & 31];
 }
@@ -428,7 +456,7 @@ static void draw_char(const cv_state_t *s, uint8_t *fb, int pitch, int index, in
          glyph = t1 ? mc6847t1_font[code] : mc6847_font[code];
          inverse = 0;
       } else if (lower && code < 32) {
-         glyph = cv_lower_glyph(code, t1 ? CV_LC_T1 : CV_LC_COCOVGA);    // lower case replaces inverse
+         glyph = cv_lower_glyph(code, t1 ? CV_LC_T1_HIGH : CV_LC_6847T1);    // lower case replaces inverse
          inverse = 0;
       } else {
          glyph = t1 ? mc6847t1_font[code] : mc6847_font[code];
@@ -726,6 +754,7 @@ int cv_lowercase_fast = 1;          // 0 = always take the general path (tests)
 static int lc_ready = 0, lc_ok = 0;
 static int8_t lc_map[1 << LC_ID];
 static uint32_t lc_expect[64];
+static uint32_t lc_dontcare[64];    // dots where the two forms of E / F / 3 differ
 
 // 'e' ($05) and 'f' ($06) are the one pair that differ in only 3 of the
 // LC_ALL dots above - lc_dots[EF_D0..EF_D2], indices 6/13/20, all row 9 of
@@ -752,7 +781,7 @@ static const uint8_t ef_extra_dot[2] = { 9, 4 };   // row 9, column 4
 // so this can only ever resolve to 'e', to 'f', or to "leave it inverse",
 // never to any other letter.
 static int ef_tiebreak(const uint8_t *fb, int pitch, int x0, int y0, uint8_t corner, uint8_t light, uint32_t sig) {
-   if ((sig ^ lc_expect[5]) & ~(uint32_t) EF_MASK) return -1;   // a non-row-9 dot is wrong: not this
+   if ((sig ^ lc_expect[5]) & ~((uint32_t) EF_MASK | lc_dontcare[5])) return -1;   // a non-row-9 dot is wrong: not this
    int c4 = fb[(y0 + ef_extra_dot[0] * 2) * pitch + x0 + ef_extra_dot[1] * 2] & CV_CODE_MASK;
    int bit3;
    if (c4 == light) bit3 = 1;
@@ -780,6 +809,14 @@ static void lc_init(void) {
    memset(lc_map, -1, sizeof(lc_map));
    for (int i = 0; i < 64; i++) {
       lc_expect[i] = lc_sig_of_glyph(i);
+      lc_dontcare[i] = 0;
+      // (only $00-$1F are turned into lower case; '3' needs no second form here)
+      int alt = i < 32 ? rom_alt_row6(i) : -1;
+      for (int j = 0; alt >= 0 && j < LC_ALL; j++) {
+         if (lc_dots[j][0] == 6 && ((alt ^ mc6847_rom_font[i][6]) & (0x80 >> lc_dots[j][1]))) lc_dontcare[i] |= 1u << j;
+      }
+      // the identification dots must not depend on which form it is
+      if (lc_dontcare[i] & ((1u << LC_ID) - 1)) return;
       unsigned int id = lc_expect[i] & ((1u << LC_ID) - 1);
       if (lc_map[id] >= 0) return;          // not unique: use the general path
       lc_map[id] = (int8_t) i;
@@ -788,16 +825,19 @@ static void lc_init(void) {
 }
 
 // minimum number of dots (of the LC_ALL checked) in which two 6847 glyphs
-// differ; exported for the test harness
+// differ, not counting the dots where a glyph's two forms differ (E, F, 3);
+// exported for the test harness
 int cv_lowercase_min_distance(void) {
    if (!lc_ready) lc_init();
    int m = 99;
    for (int i = 0; i < 64; i++) {
       for (int j = i + 1; j < 64; j++) {
-         uint32_t v = lc_expect[i] ^ lc_expect[j];
-         int d = 0;
-         while (v) { d += v & 1; v >>= 1; }
-         if (d < m) m = d;
+         for (int k = 0; k < 2; k++) {
+            uint32_t v = (lc_expect[i] ^ lc_expect[j]) & ~(k ? lc_dontcare[j] : lc_dontcare[i]);
+            int d = 0;
+            while (v) { d += v & 1; v >>= 1; }
+            if (d < m) m = d;
+         }
       }
    }
    return lc_ok ? m : 0;
@@ -834,7 +874,7 @@ static int lowercase_32_fast(cv_state_t *s, uint8_t *fb, int pitch, int *pos, in
       if (!ok) continue;
       int code = lc_map[sig & ((1u << LC_ID) - 1)];
       if (code < 0 || code >= 32) continue;   // $20-$3F stay inverse, as on the 6847T1
-      if (sig != lc_expect[code]) {
+      if ((sig ^ lc_expect[code]) & ~lc_dontcare[code]) {
          if (code != 5 && code != 6) continue;        // dots don't fit that glyph: leave it
          code = ef_tiebreak(fb, pitch, x0, y0, corner, light, sig);
          if (code < 0) continue;                      // not actually 'e'/'f', or a genuine tie
@@ -926,7 +966,7 @@ int cv_lowercase_32(cv_state_t *s, uint8_t *fb, int pitch) {
          if (!ok) continue;
          int code = -1;
          for (int i = 0; i < 32; i++) {
-            if (memcmp(strokes, mc6847_rom_font[i], 12) == 0) { code = i; break; }
+            if (rom_glyph_is(strokes, i)) { code = i; break; }
          }
          if (code < 0) continue;      // $20-$3F stay inverse, as on the 6847T1
          const uint8_t *glyph = cv_lower_glyph(code, style);   // next to the 6847's capitals

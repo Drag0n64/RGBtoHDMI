@@ -183,16 +183,15 @@ const uint8_t mc6847t1_font[96][12] = {
 };
 
 // The MC6847's own built-in character set, as the chip draws it. It differs
-// from CoCoVGA's default set above in one glyph: '3' has a 2 dot middle
-// stroke. Used wherever characters drawn by the 6847 are recognised
-// (register page, 32 column lower case); mc6847_font is what CoCoVGA draws.
+// from CoCoVGA's default set above in '3' (2 dot middle stroke). Used
+// wherever characters drawn by the 6847 are recognised (register page, 32
+// column lower case); mc6847_font is what CoCoVGA draws.
 //
-// 'E' and 'F' were previously taken from XRoar's font-6847.c with their
-// middle bar widened to 4 dots, on the assumption that it matched XRoar's
-// (and so, presumably, real) MC6847 output. A real MC6847digitizer capture
-// showed this to be wrong - every 'e'/'f' decoded as inverse, every time,
-// because of it - the real chip's middle bar for 'E'/'F' is 3 dots wide,
-// same as CoCoVGA's own default.
+// Plain 6847s differ among themselves in row 6 of 'E', 'F' and '3': a real
+// Dragon's draws 'E' / 'F' with the 3 dot middle bar below (every 'e' / 'f'
+// stayed inverse until this was found on real hardware), the Acorn Atom's
+// (as in XRoar) with 4 dots; '3' has a 2 or 1 dot stroke. cocovga.c
+// (rom_alt_row6) recognises the other form of each as well.
 const uint8_t mc6847_rom_font[64][12] = {
    { 0x00, 0x00, 0x00, 0x1C, 0x22, 0x02, 0x1A, 0x2A, 0x2A, 0x1C, 0x00, 0x00 },   // @
    { 0x00, 0x00, 0x00, 0x08, 0x14, 0x22, 0x22, 0x3E, 0x22, 0x22, 0x00, 0x00 },   // A

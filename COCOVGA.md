@@ -73,7 +73,11 @@ therefore recognises register pages by their content instead.
 * MC6847T1: transcribed from Motorola's MC6847T1 data sheet, Figure 24
   "Character ROM Pattern", and checked against an independent
   reconstruction (DamienG's FontStruct): 90 of 93 glyphs identical, the
-  remaining 3 re-checked against the data sheet scan.
+  remaining 3 re-checked against the data sheet scan. Photos and RGBtoHDMI
+  captures of real 6847T1s (XC80652P in later CoCo 2s) match the data sheet,
+  with every character at the top of the cell (rows 1-7) rather than the
+  bottom; the "T1" fonts in MAME / MESS are the CoCo 3 GIME's instead
+  (stardot.org.uk, "6847t1 Font Mystery").
 * Dragon 200-E lower case (32 columns only): the 200-E's lower case
   character ROM, as dumped in
   [go4retro/dragon200e-lowercase](https://github.com/go4retro/dragon200e-lowercase)
@@ -198,11 +202,13 @@ stays for it (instead of one frame of raw CG2 data) and W64 starts from the
 next frame. The same is done for a first CG2 frame with a row torn by a
 write during the scan, for at most `CV_ENTRY_HOLDS` (2) frames in a row.
 
-This found that the 6847's own character set differs from CoCoVGA's in
-'3' (2 dot middle stroke); cells drawn by the 6847 are recognised with the
-6847's glyphs (`mc6847_rom_font`). XRoar's 'E' and 'F' have a 4 dot middle
-bar, but a real MC6847digitizer capture showed 3 dots, as in CoCoVGA's set,
-so those follow the real chip.
+Cells drawn by the 6847 are recognised with the 6847's own glyphs
+(`mc6847_rom_font`), which differ from CoCoVGA's set. Plain 6847 chips also
+differ among themselves in 'E', 'F' and '3' (row 6 only): a real Dragon's
+6847 draws 'E' / 'F' with a 3 dot middle bar, the Acorn Atom's (and XRoar)
+with 4 dots, and '3' with a 2 or 1 dot middle stroke (MAME has both sets).
+Both forms of each are recognised; the PC harness checks the 3 dot form,
+XRoar the 4 dot one.
 
 ## Frame buffer depth and HDMI audio
 
@@ -229,15 +235,16 @@ Setting: **Palette Menu → 32 Col Lower Case** (`cocovga_lower_case=`):
 
 | Value | Lower case | Glyphs |
 |---|---|---|
-| Auto (default) | when a CoCoVGA register page sets the font register's "force lower case" bit (NitrOS-9's CoVGA driver does; from BASIC use CCVCNF32.BAS) | CoCoVGA's lower case |
+| Auto (default) | when a CoCoVGA register page sets the font register's "force lower case" bit (NitrOS-9's CoVGA driver does; from BASIC use CCVCNF32.BAS) | 6847T1 lower case |
 | Off | never: inverse stays inverse, as on a plain 6847 | - |
-| CoCoVGA | always, no register page needed (e.g. BASIC typing after SHIFT-0) | CoCoVGA's lower case |
+| 6847T1 | always, no register page needed (e.g. BASIC typing after SHIFT-0) | 6847T1 lower case |
 | Dragon 200-E | always, no register page needed | the Dragon 200-E's lower case ROM |
 
-Both fonts sit on the baseline of the 6847's capitals. The MC6847T1's own
-lower case is not offered here: it is drawn for the T1's capitals, which sit
-two rows higher, so next to the 6847's capitals it looks misaligned (W64
-still uses it with T1 capitals when the font register's T1 bit is set).
+Both fonts sit on the baseline of the 6847's capitals. A real 6847T1 draws
+all its characters two rows higher (at the top of the cell), so its lower
+case is moved down 2 rows here to line up with the plain 6847's capitals;
+W64 with the font register's T1 bit draws T1 capitals and lower case
+unmoved, as a 6847T1 does.
 
 It needs **CoCoVGA 64 Col** on. With lower case on, inverse
 characters $00-$1F on the normal 32x16 text screen are shown as lower case,

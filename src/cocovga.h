@@ -109,9 +109,11 @@ typedef struct {
    // limit) and shown when complete
    int lc_buf;                 // buffer being fixed up, -1 = none
    int lc_pos;                 // next cell (0-511)
-   // which lower case glyphs replace an inverse cell: CV_LC_COCOVGA or
-   // CV_LC_DRAGON200E (the 6847T1's own shapes sit too high next to the
-   // 6847's capitals, so they are only used by W64 with T1 capitals)
+   // which lower case glyphs replace an inverse cell: CV_LC_6847T1 or
+   // CV_LC_DRAGON200E. A real 6847T1 draws all its characters at the top
+   // of the cell (rows 1-7, see cocovga_font.c), so next to the plain
+   // 6847's capitals (rows 3-9) its lower case is moved down 2 rows; the
+   // unmoved shapes are used only by W64 together with T1 capitals
    int lc_font;
    // whether inverse cells are replaced at all: -1 = follow regs.font bit 1
    // (the CoCoVGA lower case bit), 0 = never (plain 6847 inverse), 1 = always
@@ -142,9 +144,9 @@ extern const uint8_t mc6847t1_font[96][12];
 extern const uint8_t mc6847_rom_font[64][12];   // the 6847's own glyphs (for recognising cells)
 extern const uint8_t dragon200e_lower_font[32][12];
 // lower case glyph for code $00-$1F, in one of these styles:
-#define CV_LC_COCOVGA     0   // MC6847T1 lower case moved down 2 rows to the
+#define CV_LC_6847T1      0   // MC6847T1 lower case moved down 2 rows to the
                               // baseline of the 6847's capitals (rows 3-9)
-#define CV_LC_T1          1   // as in the MC6847T1 table, next to T1 capitals
+#define CV_LC_T1_HIGH     1   // as in the MC6847T1 table, next to T1 capitals
                               // (rows 1-7; W64 with the font register's T1 bit)
 #define CV_LC_DRAGON200E  2   // the Dragon 200-E's lower case ROM
 const uint8_t *cv_lower_glyph(int code, int style);

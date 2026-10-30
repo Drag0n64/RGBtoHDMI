@@ -3014,10 +3014,10 @@ void cocovga_frame_hook(int captured, unsigned int flags) {
     }
     // 32 column lower case, read fresh so a menu change applies to the very
     // next frame: Auto = the CoCoVGA register page turns it on/off, Off =
-    // never (plain 6847 inverse), CoCoVGA / Dragon 200-E = always on with that
+    // never (plain 6847 inverse), 6847T1 / Dragon 200-E = always on with that
     // lower case font, no register page needed
     static const signed char lc_on[]   = { -1, 0, 1, 1 };
-    static const signed char lc_font[] = { CV_LC_COCOVGA, CV_LC_COCOVGA, CV_LC_COCOVGA, CV_LC_DRAGON200E };
+    static const signed char lc_font[] = { CV_LC_6847T1, CV_LC_6847T1, CV_LC_6847T1, CV_LC_DRAGON200E };
     int lc = parameters[F_COCOVGA_LC_FONT];
     if (lc < 0 || lc > 3) lc = 0;
     cocovga_state.lc_on_mode = lc_on[lc];

@@ -192,7 +192,7 @@ static const char *artifact6847_names[] = {
 static const char *cocovga_lc_font_names[] = {
    "Auto",
    "Off",
-   "CoCoVGA",
+   "6847T1",
    "Dragon 200-E"
 };
 
